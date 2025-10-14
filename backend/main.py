@@ -1,14 +1,28 @@
 from fastapi import FastAPI, WebSocket, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 import asyncio
 import json
 import os
-from painter import PaintManager
+from .painter import PaintManager
 
+# === 1. 创建 FastAPI 实例 ===
 app = FastAPI()
 
-# 允许前端跨域
+# === 2. 配置路径 ===
+BASE_DIR = Path(__file__).resolve().parent.parent
+FRONTEND_DIR = BASE_DIR / "frontend"
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# === 3. 挂载静态文件（必须在 app 创建之后！）===
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+else:
+    print(f"警告: 前端目录不存在 {FRONTEND_DIR}")
+
+# === 4. 添加中间件 ===
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,10 +30,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 挂载前端静态文件
-app.mount("/static", StaticFiles(directory="../frontend"), name="static")
-
 paint_manager = PaintManager()
 PRESET_ACCOUNTS = [
     {"uid": 661094,  "key": "lDrv8W9u"},
