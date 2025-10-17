@@ -2,9 +2,7 @@
 
 > **Python 后端 + Web 前端** 实现的高性能、多线程、实时预览自动绘画工具，专为 [洛谷 LGS Paintboard 2026](https://paintboard.luogu.me) 设计。
 
-![Paintboard Preview](https://via.placeholder.com/800x400/e0e0e0/000000?text=Real-time+Preview+Demo)  
-*（实际界面包含画板预览、进度条、控制面板）*
-
+`pip install PyQt6 PyQt6-Fluent-Widgets pillow numpy websockets requests`
 ---
 
 ## ✨ 核心特性
@@ -19,9 +17,3 @@
 - ✅ **粘包优化**：每 10ms 批量发送，避免触发限流
 
 ---
-
-## pypi 库文件
-
-```
-pip install rich pillow aiohttp keyboard
-```
