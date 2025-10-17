@@ -1,6 +1,6 @@
 # 🎨 LGS Paintboard 2026 自动绘画工具
 
-> **Python 后端 + Web 前端** 实现的高性能、多线程、实时预览自动绘画工具，专为 [洛谷 LGS Paintboard 2026](https://paintboard.luogu.me) 设计。
+> **Python** 实现的高性能、多线程、实时预览自动绘画工具，专为 [洛谷 LGS Paintboard 2026](https://paintboard.luogu.me) 设计。
 
 `pip install PyQt6 PyQt6-Fluent-Widgets pillow numpy websockets requests`
 ---
