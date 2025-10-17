@@ -639,7 +639,9 @@ if __name__ == "__main__":
         image_path = sys.argv[1]
         offset_x = int(sys.argv[2]) if len(sys.argv) > 2 else 0
         offset_y = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-        mode = sys.argv[4] if len(sys.argv) > 4 else "normal"
+        mode="normal"
+        if len(sys.argv) > 4 and sys.argv[4]=="1":
+            mode="random"
         painter = ImagePainter(image_path, offset_x, offset_y, mode)
         asyncio.run(painter.run())
     else:
