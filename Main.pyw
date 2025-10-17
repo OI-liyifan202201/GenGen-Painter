@@ -5,6 +5,7 @@ import json
 import logging
 import numpy as np
 import re
+import tempfile
 from PIL import Image
 from collections import deque
 from typing import Optional, Tuple
@@ -12,22 +13,21 @@ from enum import Enum
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QPushButton, QComboBox,
                              QSpinBox, QTextEdit, QGroupBox,
-                             QFileDialog, QProgressBar, QMessageBox, QGraphicsDropShadowEffect, QFrame)
+                             QFileDialog, QProgressBar, QMessageBox, QFrame)
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSize, QProcess, QObject, QRect
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QCursor
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor
 
 from qfluentwidgets import (PrimaryPushButton, ComboBox, SpinBox,
                             ProgressBar, TextEdit, TitleLabel,
                             BodyLabel, CaptionLabel, StrongBodyLabel)
 HAS_FLUENT = True
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 🔧 修复：移除多余空格
 API_BASE_URL = "https://paintboard.luogu.me"
 
-# 日志解析正则
 PROGRESS_PATTERN = re.compile(
     r".*初始进度:\s*(\d+)/(\d+)\s*\((\d+(?:\.\d+)?)%\)\s*- 修复任务:\s*(\d+)\s*- 活动进程:\s*(\d+)/(\d+)"
 )
@@ -43,9 +43,10 @@ class ConsoleRunner(QThread):
     output_received = pyqtSignal(str)
     finished = pyqtSignal(int)
 
-    def __init__(self, cmd: list):
+    def __init__(self, cmd: list, temp_file: Optional[str] = None):
         super().__init__()
         self.cmd = cmd
+        self.temp_file = temp_file  # 用于后续清理
         self.process = None
 
     def run(self):
@@ -77,16 +78,22 @@ class ConsoleRunner(QThread):
             except subprocess.TimeoutExpired:
                 self.process.kill()
 
+    def cleanup_temp(self):
+        if self.temp_file and os.path.exists(self.temp_file):
+            try:
+                os.remove(self.temp_file)
+            except Exception as e:
+                logger.warning(f"Failed to remove temp file {self.temp_file}: {e}")
+
 class CanvasWidget(QWidget):
     image_moved = pyqtSignal(int, int)
-    image_resized = pyqtSignal(float)
 
     def __init__(self):
         super().__init__()
         self.setMinimumSize(500, 300)
         self.board_img = None
-        self.user_img_original = None
-        self.user_img_display = None
+        self.user_img_original = None  # PIL Image, 原始
+        self.user_img_display = None   # QPixmap, 用于显示
         self.offset_x = 0
         self.offset_y = 0
         self.user_scale = 1.0
@@ -94,10 +101,7 @@ class CanvasWidget(QWidget):
         self.board_data = None
 
         self.dragging = False
-        self.resizing = False
         self.drag_start_pos = None
-        self.resize_handle_radius = 8
-        self.handle_hover = False
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def set_board_image(self, img_data: np.ndarray):
@@ -115,9 +119,15 @@ class CanvasWidget(QWidget):
     def set_user_image(self, img: Image.Image, ox: int, oy: int, scale: float = 1.0):
         if img:
             self.user_img_original = img.copy()
-            self.offset_x = max(0, min(ox, 1000))
-            self.offset_y = max(0, min(oy, 600))
-            self.user_scale = max(0.1, scale)
+            self.user_scale = max(0.1, min(5.0, scale))
+            # 限制 offset 在有效范围内
+            img_w, img_h = img.size
+            scaled_w = int(img_w * self.user_scale)
+            scaled_h = int(img_h * self.user_scale)
+            max_x = max(0, 1000 - scaled_w)
+            max_y = max(0, 600 - scaled_h)
+            self.offset_x = max(0, min(ox, max_x))
+            self.offset_y = max(0, min(oy, max_y))
             self._update_user_display()
             self.update()
 
@@ -129,6 +139,7 @@ class CanvasWidget(QWidget):
         new_w = int(w0 * self.user_scale)
         new_h = int(h0 * self.user_scale)
         if new_w < 1 or new_h < 1:
+            self.user_img_display = None
             return
         resized_img = self.user_img_original.resize((new_w, new_h), Image.Resampling.LANCZOS)
         if resized_img.mode != 'RGB':
@@ -196,13 +207,6 @@ class CanvasWidget(QWidget):
             painter.setPen(QPen(QColor(255, 0, 0), 2))
             painter.drawRect(int(ux), int(uy), actual_w, actual_h)
 
-            # Draw resize handle
-            handle_x = ux + actual_w - self.resize_handle_radius
-            handle_y = uy + actual_h - self.resize_handle_radius
-            painter.setPen(QPen(QColor(0, 120, 215), 2))
-            painter.setBrush(QColor(255, 255, 255))
-            painter.drawEllipse(int(handle_x), int(handle_y), self.resize_handle_radius * 2, self.resize_handle_radius * 2)
-
         # Grid
         painter.setPen(QPen(QColor(200, 200, 200), 1))
         for x in range(0, 1001, 200):
@@ -223,82 +227,42 @@ class CanvasWidget(QWidget):
         board_x, board_y, _, _ = self._get_board_rect()
         user_rect = self._get_user_image_rect(board_x, board_y)
 
-        if user_rect:
-            handle_rect = QRect(
-                user_rect.right() - self.resize_handle_radius,
-                user_rect.bottom() - self.resize_handle_radius,
-                self.resize_handle_radius * 2,
-                self.resize_handle_radius * 2
-            )
-            if handle_rect.contains(pos):
-                self.resizing = True
-                self.drag_start_pos = pos
-                self.orig_user_scale = self.user_scale
-                self.orig_img_size = self.user_img_original.size
-                event.accept()
-                return
-            elif user_rect.contains(pos):
-                self.dragging = True
-                self.drag_start_pos = pos
-                self.orig_offset = (self.offset_x, self.offset_y)
-                event.accept()
-                return
+        if user_rect and user_rect.contains(pos):
+            self.dragging = True
+            self.drag_start_pos = pos
+            self.orig_offset = (self.offset_x, self.offset_y)
+            event.accept()
+            return
 
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        pos = event.pos()
-        board_x, board_y, _, _ = self._get_board_rect()
-        user_rect = self._get_user_image_rect(board_x, board_y)
-
         if self.dragging and self.drag_start_pos:
+            pos = event.pos()
+            board_x, board_y, _, _ = self._get_board_rect()
             dx = (pos.x() - self.drag_start_pos.x()) / self.scale
             dy = (pos.y() - self.drag_start_pos.y()) / self.scale
             new_ox = int(self.orig_offset[0] + dx)
             new_oy = int(self.orig_offset[1] + dy)
-            if self.user_img_display:
-                max_w = 1000 - self.user_img_display.width() // self.user_scale
-                max_h = 600 - self.user_img_display.height() // self.user_scale
-                new_ox = max(0, min(int(max_w), new_ox))
-                new_oy = max(0, min(int(max_h), new_oy))
+
+            # ✅ 正确计算边界：使用原始图像尺寸和当前缩放
+            if self.user_img_original:
+                orig_w, orig_h = self.user_img_original.size
+                scaled_w = int(orig_w * self.user_scale)
+                scaled_h = int(orig_h * self.user_scale)
+                max_x = max(0, 1000 - scaled_w)
+                max_y = max(0, 600 - scaled_h)
+                new_ox = max(0, min(new_ox, max_x))
+                new_oy = max(0, min(new_oy, max_y))
+
             self.offset_x = new_ox
             self.offset_y = new_oy
             self.image_moved.emit(new_ox, new_oy)
             self.update()
-        elif self.resizing and self.drag_start_pos:
-            dx = (pos.x() - self.drag_start_pos.x()) / self.scale
-            orig_w = self.orig_img_size[0]
-            new_w = orig_w + dx
-            new_w = max(20, new_w)
-            new_scale = new_w / orig_w
-            self.user_scale = new_scale
-            self._update_user_display()
-            self.image_resized.emit(new_scale)
-            self.update()
-        else:
-            if user_rect:
-                handle_rect = QRect(
-                    user_rect.right() - self.resize_handle_radius,
-                    user_rect.bottom() - self.resize_handle_radius,
-                    self.resize_handle_radius * 2,
-                    self.resize_handle_radius * 2
-                )
-                if handle_rect.contains(pos):
-                    self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-                    self.handle_hover = True
-                else:
-                    if self.handle_hover:
-                        self.setCursor(Qt.CursorShape.ArrowCursor)
-                        self.handle_hover = False
-            else:
-                if self.handle_hover:
-                    self.setCursor(Qt.CursorShape.ArrowCursor)
-                    self.handle_hover = False
         event.accept()
 
     def mouseReleaseEvent(self, event):
         self.dragging = False
-        self.resizing = False
         self.drag_start_pos = None
         event.accept()
 
@@ -309,7 +273,7 @@ class BoardMonitor(QThread):
     def __init__(self):
         super().__init__()
         self.running = False
-        self.update_interval = 1  # 🔁 每秒刷新一次
+        self.update_interval = 1
 
     def run(self):
         self.running = True
@@ -364,6 +328,7 @@ class MainWindow(QMainWindow):
         img_layout = QVBoxLayout(img_group)
         self.btn_load = PrimaryPushButton("上传图片")
         img_layout.addWidget(self.btn_load)
+
         img_layout.addWidget(StrongBodyLabel("位置调整:"))
         pos_layout = QHBoxLayout()
         pos_layout.addWidget(BodyLabel("X:"))
@@ -375,6 +340,16 @@ class MainWindow(QMainWindow):
         self.spin_y.setRange(0, 600)
         pos_layout.addWidget(self.spin_y)
         img_layout.addLayout(pos_layout)
+
+        scale_layout = QHBoxLayout()
+        scale_layout.addWidget(BodyLabel("缩放:"))
+        self.spin_scale = SpinBox()
+        self.spin_scale.setRange(10, 500)   # 0.1 ~ 5.0
+        self.spin_scale.setValue(100)       # 1.0
+        self.spin_scale.setSingleStep(10)   # 0.1 步长
+        scale_layout.addWidget(self.spin_scale)
+        img_layout.addLayout(scale_layout)
+
         self.btn_refresh = PrimaryPushButton("手动刷新画板")
         img_layout.addWidget(self.btn_refresh)
         left_layout.addWidget(img_group)
@@ -406,9 +381,10 @@ class MainWindow(QMainWindow):
         info_group = QGroupBox("说明")
         info_layout = QVBoxLayout(info_group)
         info_text = QLabel(
-            "• 上传图片后可拖动或调整大小\n"
+            "• 上传图片后可拖动调整位置\n"
+            "• 缩放比例通过输入框设置（0.1~5.0）\n"
             "• 点击“开始绘画”将调用:\n"
-            "  python Console.py [图片] [X] [Y] [模式]\n"
+            "  python Console.py [缩放后图片] [X] [Y] [模式]\n"
             "• 模式: 0=逐行, 1=随机\n"
             "• 画板每秒自动刷新"
         )
@@ -435,24 +411,15 @@ class MainWindow(QMainWindow):
         self.btn_refresh.clicked.connect(self.refresh_board)
         self.spin_x.valueChanged.connect(self.update_offset_from_spin)
         self.spin_y.valueChanged.connect(self.update_offset_from_spin)
+        self.spin_scale.valueChanged.connect(self.update_scale_from_spin)
         self.board_monitor.board_updated.connect(self.canvas.set_board_image)
         self.canvas.image_moved.connect(self.on_image_moved)
-        self.canvas.image_resized.connect(self.on_image_resized)
 
     def on_image_moved(self, ox, oy):
         self.offset_x = ox
         self.offset_y = oy
         self.spin_x.setValue(ox)
         self.spin_y.setValue(oy)
-
-    def on_image_resized(self, scale):
-        self.user_image_scale = scale
-        if self.current_image_path:
-            try:
-                img = Image.open(self.current_image_path).convert('RGB')
-                self.canvas.set_user_image(img, self.offset_x, self.offset_y, scale)
-            except Exception as e:
-                self.log_error(f"缩放失败: {e}")
 
     def load_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -463,7 +430,8 @@ class MainWindow(QMainWindow):
             try:
                 img = Image.open(path).convert('RGB')
                 self.user_image_scale = 1.0
-                self.canvas.set_user_image(img, self.offset_x, self.offset_y, 1.0)
+                self.spin_scale.setValue(100)
+                self.canvas.set_user_image(img, 0, 0, 1.0)  # 初始位置设为 (0,0)
                 w, h = img.size
                 self.log_info(f"加载图片: {w}x{h}")
             except Exception as e:
@@ -497,6 +465,16 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.log_error(f"更新偏移失败: {e}")
 
+    def update_scale_from_spin(self):
+        scale = self.spin_scale.value() / 100.0
+        self.user_image_scale = max(0.1, min(5.0, scale))
+        if self.current_image_path:
+            try:
+                img = Image.open(self.current_image_path).convert('RGB')
+                self.canvas.set_user_image(img, self.offset_x, self.offset_y, self.user_image_scale)
+            except Exception as e:
+                self.log_error(f"更新缩放失败: {e}")
+
     def start_painting(self):
         if not self.current_image_path:
             self.show_message("错误", "请先上传图片")
@@ -513,15 +491,33 @@ class MainWindow(QMainWindow):
             return
 
         mode_int = mode_enum.to_int()
+
+        # ✅ 生成缩放后的临时图像
+        try:
+            original_img = Image.open(self.current_image_path).convert('RGB')
+            scaled_w = int(original_img.width * self.user_image_scale)
+            scaled_h = int(original_img.height * self.user_image_scale)
+            if scaled_w < 1 or scaled_h < 1:
+                raise ValueError("缩放后图像尺寸无效")
+            scaled_img = original_img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
+                temp_path = tmp.name
+            scaled_img.save(temp_path, 'PNG')
+        except Exception as e:
+            self.log_error(f"生成缩放图像失败: {e}")
+            return
+
         cmd = [
             sys.executable, "Console.py",
-            self.current_image_path,
+            temp_path,
             str(self.offset_x),
             str(self.offset_y),
             str(mode_int)
         ]
 
-        self.console_runner = ConsoleRunner(cmd)
+        self.console_runner = ConsoleRunner(cmd, temp_file=temp_path)
         self.console_runner.output_received.connect(self.log_info)
         self.console_runner.finished.connect(self.on_console_finished)
         self.console_runner.start()
@@ -538,6 +534,8 @@ class MainWindow(QMainWindow):
         self.on_console_finished(-1)
 
     def on_console_finished(self, exit_code: int):
+        if self.console_runner:
+            self.console_runner.cleanup_temp()
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         if exit_code == 0:
@@ -585,6 +583,7 @@ class MainWindow(QMainWindow):
         if self.console_runner and self.console_runner.isRunning():
             self.console_runner.stop()
             self.console_runner.wait()
+            self.console_runner.cleanup_temp()
         if self.board_monitor.isRunning():
             self.board_monitor.stop()
             self.board_monitor.wait()
