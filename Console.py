@@ -14,12 +14,8 @@ from typing import List, Tuple, Optional, Dict
 import sys
 import os
 import random
-import math
 
-# 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
+# 修复：删除末尾空格！
 API_BASE_URL = "https://paintboard.luogu.me"
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
@@ -116,7 +112,7 @@ class PaintBoardClient:
                 self.connected = False
 
     async def send_paint_data(self, x: int, y: int, r: int, g: int, b: int):
-        """发送绘画数据"""
+        """发送绘画数据（单个像素）"""
         if not await self.ensure_connected() or self.token is None:
             return None
             
@@ -144,23 +140,48 @@ class PaintBoardClient:
             logger.error(f"用户 {self.uid} 准备绘图数据失败: {e}")
             return None
 
-    async def flush_messages(self):
-        """发送所有排队的消息（粘包发送）"""
+    async def flush_messages(self, max_packet_size: int = 32000):
+        """分块发送消息，确保每个包不超过 max_packet_size 字节（≈32KB）"""
         if not await self.ensure_connected() or len(self.message_queue) == 0 or self.websocket is None:
             return
-            
+
         try:
-            total_length = sum(len(msg) for msg in self.message_queue)
-            merged_packet = bytearray(total_length)
-            offset = 0
-            for msg in self.message_queue:
-                merged_packet[offset:offset+len(msg)] = msg
-                offset += len(msg)
-                
-            await self.websocket.send(merged_packet)
-            self.message_queue.clear()
+            current_batch = []
+            current_size = 0
+
+            while self.message_queue:
+                msg = self.message_queue[0]
+                if current_size + len(msg) > max_packet_size:
+                    if current_batch:
+                        total_len = sum(len(m) for m in current_batch)
+                        merged = bytearray(total_len)
+                        off = 0
+                        for m in current_batch:
+                            merged[off:off+len(m)] = m
+                            off += len(m)
+                        await self.websocket.send(merged)
+                        current_batch = []
+                        current_size = 0
+                    else:
+                        # 单个消息超限？理论上不会（29B << 32KB）
+                        msg = self.message_queue.popleft()
+                        await self.websocket.send(msg)
+                        continue
+
+                current_batch.append(self.message_queue.popleft())
+                current_size += len(msg)
+
+            if current_batch:
+                total_len = sum(len(m) for m in current_batch)
+                merged = bytearray(total_len)
+                off = 0
+                for m in current_batch:
+                    merged[off:off+len(m)] = m
+                    off += len(m)
+                await self.websocket.send(merged)
+
         except Exception as e:
-            logger.error(f"用户 {self.uid} 发送消息失败: {e}")
+            logger.error(f"用户 {self.uid} 分块发送消息失败: {e}")
             self.connected = False
 
     async def listen_messages(self):
@@ -220,119 +241,101 @@ class PaintBoardClient:
                 logger.warning(f"未知操作码: {opcode:02x}")
                 break
 
+
 class WorkScheduler:
     def __init__(self, image_data: np.ndarray, offset_x: int = 0, offset_y: int = 0, mode: str = "normal"):
         self.image_data = image_data
         self.height, self.width, _ = image_data.shape
         self.offset_x = offset_x
         self.offset_y = offset_y
-        self.mode = mode  # "normal" 或 "random"
-        
-        # 初始工作负载：所有需要绘制的像素
+        self.mode = mode  # "normal" (scanline) 或 "random"
+
         self.initial_workload = np.ones((self.height, self.width), dtype=bool)
-        
-        # 修复工作负载：被修改需要修复的像素
         self.repair_workload = np.zeros((self.height, self.width), dtype=bool)
-        
-        # 用于随机模式的索引列表
-        self.initial_indices = self._generate_all_indices()
-        self.current_initial_index = 0
-        random.shuffle(self.initial_indices)  # 随机打乱初始顺序
-        
+
+        # 扫描线游标（仅用于 normal 模式）
+        self.scanline_y = 0
+        self.scanline_x = 0
+
+        # 随机模式
+        if self.mode == "random":
+            self.random_indices = [(x, y) for y in range(self.height) for x in range(self.width)]
+            random.shuffle(self.random_indices)
+            self.random_index = 0
+        else:
+            self.random_indices = []
+            self.random_index = 0
+
         self.lock = threading.Lock()
         self.initial_completed = 0
         self.repair_count = 0
         self.total_initial_pixels = self.height * self.width
         self.last_work_time = time.time()
-        
-    def _generate_all_indices(self) -> List[Tuple[int, int]]:
-        """生成所有像素坐标的列表"""
-        indices = []
-        for y in range(self.height):
-            for x in range(self.width):
-                indices.append((x, y))
-        return indices
-        
-    def get_work_chunk(self, chunk_size: int = 50, repair_priority: bool = False) -> List[Tuple[int, int, int, int, int]]:
-        """获取工作块，优先返回修复任务"""
+
+    def get_work_chunk(self, max_pixels: int = 800, repair_priority: bool = False) -> List[Tuple[int, int, int, int, int]]:
+        """获取工作块，优先修复；返回像素列表"""
         with self.lock:
             coords = []
             count = 0
-            
-            # 优先处理修复任务
+
+            # 1. 优先处理修复任务
             if repair_priority and self.repair_count > 0:
-                repair_indices = []
+                repair_list = []
                 for y in range(self.height):
                     for x in range(self.width):
-                        if bool(self.repair_workload[y, x]):
-                            repair_indices.append((x, y))
-                
-                if repair_indices:
-                    # 随机选择修复任务
-                    random.shuffle(repair_indices)
-                    for x, y in repair_indices[:chunk_size]:
+                        if self.repair_workload[y, x]:
+                            repair_list.append((x, y))
+                random.shuffle(repair_list)
+                for x, y in repair_list[:max_pixels]:
+                    r, g, b = self.image_data[y, x]
+                    coords.append((x + self.offset_x, y + self.offset_y, r, g, b))
+                    self.repair_workload[y, x] = False
+                    self.repair_count -= 1
+                    count += 1
+                    if count >= max_pixels:
+                        return coords
+
+            # 2. 处理初始绘制
+            remaining = max_pixels - count
+            if remaining <= 0:
+                return coords
+
+            if self.mode == "random":
+                added = 0
+                while added < remaining and self.random_index < len(self.random_indices):
+                    x, y = self.random_indices[self.random_index]
+                    self.random_index += 1
+                    if self.initial_workload[y, x]:
                         r, g, b = self.image_data[y, x]
-                        actual_x = x + self.offset_x
-                        actual_y = y + self.offset_y
-                        coords.append((actual_x, actual_y, r, g, b))
-                        self.repair_workload[y, x] = False
-                        self.repair_count -= 1  # 修复队列减少
-                        count += 1
-                        if count >= chunk_size:
-                            break
-            
-            # 如果没有足够的修复任务，添加初始绘制任务
-            if count < chunk_size:
-                remaining = chunk_size - count
-                
-                if self.mode == "random":
-                    # 随机撒点模式
-                    indices_to_process = []
-                    while self.current_initial_index < len(self.initial_indices) and len(indices_to_process) < remaining:
-                        x, y = self.initial_indices[self.current_initial_index]
-                        if bool(self.initial_workload[y, x]):
-                            indices_to_process.append((x, y))
-                        self.current_initial_index += 1
-                    
-                    # 如果到达末尾，重新开始
-                    if self.current_initial_index >= len(self.initial_indices):
-                        self.current_initial_index = 0
-                        # 重新打乱顺序
-                        remaining_indices = [idx for idx in self.initial_indices if bool(self.initial_workload[idx[1], idx[0]])]
-                        random.shuffle(remaining_indices)
-                        # 补充剩余需要处理的位置
-                        while len(indices_to_process) < remaining and remaining_indices:
-                            x, y = remaining_indices.pop()
-                            indices_to_process.append((x, y))
-                    
-                    for x, y in indices_to_process:
-                        if bool(self.initial_workload[y, x]):
+                        coords.append((x + self.offset_x, y + self.offset_y, r, g, b))
+                        self.initial_workload[y, x] = False
+                        self.initial_completed += 1
+                        added += 1
+                # 如果用完，重新生成未完成的
+                if self.random_index >= len(self.random_indices):
+                    self.random_indices = [(x, y) for y in range(self.height) for x in range(self.width)
+                                          if self.initial_workload[y, x]]
+                    random.shuffle(self.random_indices)
+                    self.random_index = 0
+
+            else:
+                # normal 模式：真正的扫描线
+                added = 0
+                while added < remaining and self.scanline_y < self.height:
+                    while self.scanline_x < self.width and added < remaining:
+                        if self.initial_workload[self.scanline_y, self.scanline_x]:
+                            x, y = self.scanline_x, self.scanline_y
                             r, g, b = self.image_data[y, x]
-                            actual_x = x + self.offset_x
-                            actual_y = y + self.offset_y
-                            coords.append((actual_x, actual_y, r, g, b))
+                            coords.append((x + self.offset_x, y + self.offset_y, r, g, b))
                             self.initial_workload[y, x] = False
                             self.initial_completed += 1
-                            count += 1
-                            
-                else:
-                    # 普通模式 - 按顺序处理
-                    for y in range(self.height):
-                        for x in range(self.width):
-                            if count >= chunk_size:
-                                break
-                            if bool(self.initial_workload[y, x]):
-                                r, g, b = self.image_data[y, x]
-                                actual_x = x + self.offset_x
-                                actual_y = y + self.offset_y
-                                coords.append((actual_x, actual_y, r, g, b))
-                                self.initial_workload[y, x] = False
-                                self.initial_completed += 1
-                                count += 1
-                        if count >= chunk_size:
-                            break
-            
-            if count > 0:
+                            added += 1
+                        self.scanline_x += 1
+                    if self.scanline_x >= self.width:
+                        self.scanline_x = 0
+                        self.scanline_y += 1
+
+            if coords:
                 self.last_work_time = time.time()
             return coords
 
@@ -342,19 +345,13 @@ class WorkScheduler:
             img_x = x - self.offset_x
             img_y = y - self.offset_y
             if 0 <= img_x < self.width and 0 <= img_y < self.height:
-                if not bool(self.repair_workload[img_y, img_x]):  # 避免重复添加
+                if not self.repair_workload[img_y, img_x]:
                     self.repair_workload[img_y, img_x] = True
                     self.repair_count += 1
 
     def mark_initial_complete(self, x: int, y: int):
-        """标记初始绘制完成"""
-        with self.lock:
-            img_x = x - self.offset_x
-            img_y = y - self.offset_y
-            if 0 <= img_x < self.width and 0 <= img_y < self.height:
-                if bool(self.initial_workload[img_y, img_x]):
-                    self.initial_workload[img_y, img_x] = False
-                    self.initial_completed += 1
+        """标记初始绘制完成（通常不需要调用，因为 get_work_chunk 已处理）"""
+        pass
 
     def get_progress(self) -> Tuple[int, int, int]:
         """获取进度：初始完成数，总初始数，修复数"""
@@ -369,16 +366,15 @@ class WorkScheduler:
     def has_work(self) -> bool:
         """检查是否有任何工作"""
         with self.lock:
-            has_initial = np.any(self.initial_workload)
-            has_repair = self.repair_count > 0
-            return bool(has_initial or has_repair)
+            return (self.initial_completed < self.total_initial_pixels) or (self.repair_count > 0)
+
 
 class ImagePainter:
     def __init__(self, image_path: str, offset_x: int = 0, offset_y: int = 0, mode: str = "normal"):
         self.image_path = image_path
         self.offset_x = offset_x
         self.offset_y = offset_y
-        self.mode = mode  # "normal" 或 "random"
+        self.mode = mode
         self.write_clients = []
         self.readonly_client = None
         self.image_data: Optional[np.ndarray] = None
@@ -386,7 +382,7 @@ class ImagePainter:
         self.workers_status = [0] * 5 
         self.current_board = None
         self.running = False
-        self.repair_interval = 5  # 修复检查间隔（秒）
+        self.repair_interval = 5
         self.last_repair_check = 0
         
         # 初始化客户端
@@ -417,7 +413,7 @@ class ImagePainter:
             self.image_data = np.array(img)
             self.scheduler = WorkScheduler(self.image_data, self.offset_x, self.offset_y, self.mode)
             logger.info(f"加载图片成功: {img.width}x{img.height} @ ({self.offset_x}, {self.offset_y})")
-            logger.info(f"工作模式: {'随机撒点模式' if self.mode == 'random' else '普通模式'}")
+            logger.info(f"工作模式: {'随机撒点模式' if self.mode == 'random' else '扫描线模式'}")
             return True
         except Exception as e:
             logger.error(f"加载图片失败 {self.image_path}: {e}")
@@ -473,27 +469,22 @@ class ImagePainter:
         """持续修复任务"""
         while self.running:
             try:
-                # 等待初始绘制基本完成后再开始修复
                 if self.scheduler and self.scheduler.initial_completed > self.scheduler.total_initial_pixels * 0.3:
                     current_time = time.time()
                     if current_time - self.last_repair_check >= self.repair_interval:
                         await self.get_board_state()
                         await self.check_and_repair()
                         self.last_repair_check = current_time
-                
-                await asyncio.sleep(2)  # 短暂休眠避免过于频繁
+                await asyncio.sleep(2)
             except Exception as e:
                 logger.error(f"持续修复任务异常: {e}")
                 await asyncio.sleep(5)
 
     async def paint_chunk(self, client: PaintBoardClient, coords: List[Tuple[int, int, int, int, int]]):
-        """绘制一个工作块"""
+        """绘制一个工作块，并分批发送（≤32KB）"""
         for x, y, r, g, b in coords:
             await client.send_paint_data(x, y, r, g, b)
-            # 标记初始绘制完成
-            if self.scheduler:
-                self.scheduler.mark_initial_complete(x, y)
-        await client.flush_messages()
+        await client.flush_messages(max_packet_size=32000)
 
     async def write_worker(self, worker_id: int):
         """写入工作线程"""
@@ -506,12 +497,10 @@ class ImagePainter:
                 await asyncio.sleep(0.05)
                 continue
             
-            # 动态调整优先级：如果有修复任务，优先处理
             repair_priority = self.scheduler.repair_count > 10
-            coords = self.scheduler.get_work_chunk(100, repair_priority)
+            coords = self.scheduler.get_work_chunk(800, repair_priority)
             
             if not coords:
-                # 如果没有工作，检查是否需要等待
                 if not self.scheduler.has_work():
                     await asyncio.sleep(0.5)
                 continue
@@ -519,7 +508,7 @@ class ImagePainter:
             self.workers_status[worker_id] = len(coords)
             await self.paint_chunk(client, coords)
             await client.listen_messages()
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)  # 更短休眠，提升响应
 
     async def readonly_worker(self):
         """只读工作线程，用于监听画板变化"""
@@ -531,11 +520,10 @@ class ImagePainter:
         
         while self.running:
             await client.listen_messages()
-            await asyncio.sleep(0.1)  # 更频繁地监听
+            await asyncio.sleep(0.05)
 
     async def progress_reporter(self):
         """进度报告器"""
-        phase = "初始绘制"
         while self.running:
             if self.scheduler is None:
                 await asyncio.sleep(2)
@@ -545,13 +533,13 @@ class ImagePainter:
             initial_progress = (initial_completed / total_initial * 100) if total_initial > 0 else 0
             active_workers = sum(1 for status in self.workers_status if status > 0)
             
-            # 更新阶段显示
+            phase = "初始绘制"
             if self.scheduler.is_initial_complete():
                 phase = "维护修复"
             elif initial_completed > total_initial * 0.8:
                 phase = "收尾绘制"
             
-            mode_display = "随机撒点" if self.mode == "random" else "普通"
+            mode_display = "随机撒点" if self.mode == "random" else "扫描线"
             logger.info(f"[{phase}][{mode_display}] 初始进度: {initial_completed}/{total_initial} ({initial_progress:.1f}%) - "
                        f"修复任务: {repair_count} - 活动进程: {active_workers}/5")
             
@@ -564,15 +552,13 @@ class ImagePainter:
             
         logger.info("启动绘图任务：5个写入线程 + 1个只读线程 + 1个修复线程")
         logger.info(f"图像偏移: ({self.offset_x}, {self.offset_y})")
-        logger.info(f"工作模式: {'随机撒点模式' if self.mode == 'random' else '普通模式'}")
+        logger.info(f"工作模式: {'随机撒点模式' if self.mode == 'random' else '扫描线模式'}")
         
-        # 获取初始画板状态
         await self.get_board_state()
         self.running = True
         tasks = []
         
         try:
-            # 启动所有工作线程
             for i in range(5):
                 tasks.append(asyncio.create_task(self.write_worker(i)))
             tasks.append(asyncio.create_task(self.readonly_worker()))
@@ -589,9 +575,10 @@ class ImagePainter:
         logger.info("绘画任务结束")
         return True
 
+
 def print_banner():
     print("=" * 60)
-    print("                    GenGen Painter")
+    print("                    GenGen Painter (Optimized)")
     print("=" * 60)
 
 def get_user_input():
@@ -606,22 +593,22 @@ def get_user_input():
         offset_y = int(input("请输入左上角Y坐标偏移 (默认0): ") or "0")
         
         print("\n请选择工作模式:")
-        print("1. 多线程普通模式 (顺序绘制)")
-        print("2. 多线程随机撒点模式 (随机绘制)")
+        print("1. 扫描线模式 (逐行绘制，最快)")
+        print("2. 随机撒点模式 (防干扰)")
         mode_choice = input("请输入选择 (1 或 2, 默认1): ").strip()
         
-        if mode_choice == "2":
-            mode = "random"
-            print("已选择: 多线程随机撒点模式")
-        else:
-            mode = "normal"
-            print("已选择: 多线程普通模式")
+        mode = "random" if mode_choice == "2" else "normal"
+        print(f"已选择: {'随机撒点模式' if mode == 'random' else '扫描线模式'}")
             
     except ValueError:
         offset_x, offset_y = 0, 0
         mode = "normal"
         
     return image_path, offset_x, offset_y, mode
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 async def main():
     image_path, offset_x, offset_y, mode = get_user_input()
@@ -639,9 +626,7 @@ if __name__ == "__main__":
         image_path = sys.argv[1]
         offset_x = int(sys.argv[2]) if len(sys.argv) > 2 else 0
         offset_y = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-        mode="normal"
-        if len(sys.argv) > 4 and sys.argv[4]=="1":
-            mode="random"
+        mode = "random" if (len(sys.argv) > 4 and sys.argv[4] == "1") else "normal"
         painter = ImagePainter(image_path, offset_x, offset_y, mode)
         asyncio.run(painter.run())
     else:
