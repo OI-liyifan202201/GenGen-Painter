@@ -17,7 +17,7 @@ import random
 import math
 
 # 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')https://bgithub.xyz
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://paintboard.luogu.me"
@@ -649,9 +649,10 @@ if __name__ == "__main__":
         offset_x = int(sys.argv[2]) if len(sys.argv) > 2 else 0
         offset_y = int(sys.argv[3]) if len(sys.argv) > 3 else 0
         mode = "scanline"
-        if len(sys.argv) > 4 and sys.argv[4] == "2":
+        if len(sys.argv) > 4 and sys.argv[4] == "1":
             mode = "random"
         painter = ImagePainter(image_path, offset_x, offset_y, mode)
         asyncio.run(painter.run())
     else:
         asyncio.run(main())
+
