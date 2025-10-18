@@ -23,46 +23,75 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "https://paintboard.luogu.me"
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
-# UID和Access Key对应表
+# UID和Access Key对应表（支持动态账户数量）
 USER_CREDENTIALS = [
     (661094, "lDrv8W9u"), (661913, "lFT03zMS"), (1351126, "UJUVuzyk"), 
     (1032267, "6XF2wDhG"), (1404345, "dJvxSGv6"), (1036010, "hcB8wQzm"), 
     (703022, "gJNV9lrN"), (1406692, "0WMtD3G7"), (1058607, "iyuq7QA2"), 
-    (1276209, "vzciwZs7"), (1227240, "WwnnjHVP"), (1406674, "NtqPbU8t")
+    (1276209, "vzciwZs7"), (1227240, "WwnnjHVP"), (1406674, "NtqPbU8t"),
+    (661984, "3BRDNLh0"), (1038207, "s3Cp6arh")
 ]
 
-class RateLimiter:
-    """速率限制器，确保每秒不超过256包"""
-    def __init__(self):
-        self.packets_per_second = 256
-        self.packet_times = deque()
+class AccountManager:
+    """账户管理器，处理每个账户的冷却时间"""
+    def __init__(self, credentials: List[Tuple[int, str]]):
+        self.accounts = []
         self.lock = threading.Lock()
+        self.cooling_time = 30  # 每个账户冷却时间（秒）
         
-    async def acquire(self):
-        """获取发送许可"""
-        while True:
-            with self.lock:
-                now = time.time()
-                # 移除超过1秒的时间戳
-                while self.packet_times and now - self.packet_times[0] > 1.0:
-                    self.packet_times.popleft()
-                
-                # 检查是否达到限制
-                if len(self.packet_times) < self.packets_per_second:
-                    self.packet_times.append(now)
-                    return
-            
-            # 等待一段时间再检查
-            await asyncio.sleep(0.001)
+        # 初始化所有账户
+        for uid, access_key in credentials:
+            self.accounts.append({
+                'uid': uid,
+                'access_key': access_key,
+                'last_used': 0,  # 上次使用时间戳
+                'token': None,
+                'client': None,
+                'cooling': False
+            })
+        
+        logger.info(f"初始化 {len(self.accounts)} 个账户用于绘制")
+    
+    def get_available_account(self) -> Optional[Dict]:
+        """获取可用的账户（未在冷却中）"""
+        with self.lock:
+            current_time = time.time()
+            for account in self.accounts:
+                # 如果账户未冷却或冷却已结束
+                if not account['cooling'] or (current_time - account['last_used'] >= self.cooling_time):
+                    account['cooling'] = True
+                    account['last_used'] = current_time
+                    return account
+            return None
+    
+    def release_account(self, uid: int):
+        """释放账户（当绘制失败时）"""
+        with self.lock:
+            for account in self.accounts:
+                if account['uid'] == uid:
+                    account['cooling'] = False
+                    break
+    
+    def update_token(self, uid: int, token: str):
+        """更新账户的token"""
+        with self.lock:
+            for account in self.accounts:
+                if account['uid'] == uid:
+                    account['token'] = token
+                    break
+    
+    def get_total_accounts(self) -> int:
+        """获取总账户数"""
+        return len(self.accounts)
 
 class PaintBoardClient:
-    def __init__(self, uid: int, access_key: str, connection_type: str = "readwrite", rate_limiter: Optional[RateLimiter] = None):
+    def __init__(self, uid: int, access_key: str, connection_type: str = "readwrite", account_manager: Optional[AccountManager] = None):
         self.uid = uid
         self.access_key = access_key
         self.connection_type = connection_type
-        self.rate_limiter = rate_limiter
+        self.account_manager = account_manager
         self.token: Optional[str] = None
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None # type: ignore
+        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self.connected = False
         self.message_queue = deque()
         self.paint_id_counter = 0
@@ -70,7 +99,9 @@ class PaintBoardClient:
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 100
         self.packet_size_limit = 32000  # 32KB限制
-        
+        self.outstanding_paints = {}  # paint_id -> (x, y, r, g, b)
+        self.work_scheduler = None  # 用于重试
+    
     async def get_token(self):
         """获取Token"""
         try:
@@ -82,6 +113,8 @@ class PaintBoardClient:
             
             if "data" in result:
                 self.token = result["data"]["token"]
+                if self.account_manager:
+                    self.account_manager.update_token(self.uid, self.token)
                 logger.info(f"用户 {self.uid} 获取 Token 成功")
                 return True
             else:
@@ -135,8 +168,6 @@ class PaintBoardClient:
         """发送心跳包"""
         if await self.ensure_connected() and self.websocket:
             try:
-                if self.rate_limiter:
-                    await self.rate_limiter.acquire()
                 await self.websocket.send(bytes([0xfb]))
                 self.last_heartbeat = time.time()
             except Exception as e:
@@ -144,7 +175,7 @@ class PaintBoardClient:
                 self.connected = False
 
     async def send_paint_data(self, x: int, y: int, r: int, g: int, b: int):
-        """发送绘画数据"""
+        """发送绘画数据（注意：此方法不处理冷却，由AccountManager控制）"""
         if not await self.ensure_connected() or self.token is None:
             return None
             
@@ -167,6 +198,7 @@ class PaintBoardClient:
             packet.extend(struct.pack('<I', paint_id))
             
             self.message_queue.append(packet)
+            self.outstanding_paints[paint_id] = (x, y, r, g, b)
             return paint_id
         except Exception as e:
             logger.error(f"用户 {self.uid} 准备绘图数据失败: {e}")
@@ -195,8 +227,6 @@ class PaintBoardClient:
             
             # 发送所有批次
             for batch in batches:
-                if self.rate_limiter:
-                    await self.rate_limiter.acquire()
                 await self.websocket.send(bytes(batch))
             
             self.message_queue.clear()
@@ -257,99 +287,99 @@ class PaintBoardClient:
                     status_msg = status_messages.get(status, f"Unknown status {status:02x}")
                     logger.debug(f"绘图结果 ID {paint_id}: {status_msg}")
                     
+                    # 处理绘图结果
+                    if paint_id in self.outstanding_paints:
+                        x, y, r, g, b = self.outstanding_paints[paint_id]
+                        del self.outstanding_paints[paint_id]
+                        
+                        if status == 0xee:  # Cooling down
+                            logger.warning(f"账户 {self.uid} 遇到冷却，重新排队 ({x}, {y})")
+                            if self.work_scheduler:
+                                self.work_scheduler.add_repair_work(x, y)
+                            # 释放账户以便重试
+                            if self.account_manager:
+                                self.account_manager.release_account(self.uid)
+                        elif status != 0xef:  # 其他错误
+                            logger.error(f"账户 {self.uid} 绘制失败 (状态 {status:02x})")
+                            if self.account_manager:
+                                self.account_manager.release_account(self.uid)
             else:
                 logger.warning(f"未知操作码: {opcode:02x}")
                 break
 
 class WorkScheduler:
-    def __init__(self, image_data: np.ndarray, offset_x: int = 0, offset_y: int = 0, mode: str = "normal"):
+    def __init__(self, image_data: np.ndarray, board: np.ndarray, offset_x: int = 0, offset_y: int = 0, mode: str = "normal"):
         self.image_data = image_data
         self.height, self.width, _ = image_data.shape
         self.offset_x = offset_x
         self.offset_y = offset_y
         self.mode = mode  # "scanline" 或 "random"
         
-        # 工作负载管理
-        if mode == "scanline":
-            # 扫描线模式：按行处理
-            self.work_queue = self._create_scanline_workload()
-        else:
-            # 随机模式：随机处理
-            self.work_queue = self._create_random_workload()
-            
-        # 修复工作负载
+        # 创建工作队列：只包含与画板不同的像素
+        self.work_queue = deque()
         self.repair_queue = deque()
         
-        self.lock = threading.Lock()
+        # 比较当前画板与目标图像
+        for y in range(self.height):
+            for x in range(self.width):
+                board_x = x + offset_x
+                board_y = y + offset_y
+                if board_x >= 1000 or board_y >= 600:
+                    continue
+                expected = image_data[y, x]
+                actual = board[board_y, board_x]
+                if not np.array_equal(expected, actual):
+                    self.work_queue.append((x, y))
+        
+        # 根据模式排序
+        if mode == "scanline":
+            # 按行处理，每行从左到右（已按顺序添加）
+            pass
+        else:
+            # 随机模式：随机处理
+            indices = list(self.work_queue)
+            random.shuffle(indices)
+            self.work_queue = deque(indices)
+            
         self.initial_completed = 0
         self.repair_count = 0
-        self.total_initial_pixels = self.height * self.width
+        self.total_initial_pixels = len(self.work_queue)
         self.last_work_time = time.time()
+        self.lock = threading.Lock()
         
-    def _create_scanline_workload(self):
-        """创建扫描线工作负载"""
-        queue = deque()
-        # 按行处理，每行从左到右
-        for y in range(self.height):
-            for x in range(self.width):
-                queue.append((x, y))
-        return queue
-        
-    def _create_random_workload(self):
-        """创建随机工作负载"""
-        indices = []
-        for y in range(self.height):
-            for x in range(self.width):
-                indices.append((x, y))
-        random.shuffle(indices)
-        return deque(indices)
-        
-    def get_work_chunk(self, chunk_size: int = 500, repair_priority: bool = False) -> List[Tuple[int, int, int, int, int]]:
-        """获取工作块，优化为最大包大小"""
+    def get_next_work(self) -> Optional[Tuple[int, int, int, int, int]]:
+        """获取下一个工作点（优先修复任务）"""
         with self.lock:
-            coords = []
-            
             # 优先处理修复任务
-            if repair_priority and self.repair_queue:
-                repair_count = min(chunk_size, len(self.repair_queue))
-                for _ in range(repair_count):
-                    if self.repair_queue:
-                        x, y = self.repair_queue.popleft()
-                        r, g, b = self.image_data[y, x]
-                        actual_x = x + self.offset_x
-                        actual_y = y + self.offset_y
-                        coords.append((actual_x, actual_y, r, g, b))
-                        self.repair_count -= 1
+            if self.repair_queue:
+                x, y = self.repair_queue.popleft()
+                self.repair_count = max(0, self.repair_count - 1)
+                r, g, b = self.image_data[y, x]
+                actual_x = x + self.offset_x
+                actual_y = y + self.offset_y
+                return (actual_x, actual_y, r, g, b)
             
-            # 如果没有足够的修复任务，添加初始绘制任务
-            remaining = chunk_size - len(coords)
-            if remaining > 0 and self.work_queue:
-                for _ in range(remaining):
-                    if self.work_queue:
-                        x, y = self.work_queue.popleft()
-                        r, g, b = self.image_data[y, x]
-                        actual_x = x + self.offset_x
-                        actual_y = y + self.offset_y
-                        coords.append((actual_x, actual_y, r, g, b))
-                        self.initial_completed += 1
+            # 处理初始任务
+            if self.work_queue:
+                x, y = self.work_queue.popleft()
+                self.initial_completed += 1
+                r, g, b = self.image_data[y, x]
+                actual_x = x + self.offset_x
+                actual_y = y + self.offset_y
+                return (actual_x, actual_y, r, g, b)
             
-            if coords:
-                self.last_work_time = time.time()
-            return coords
+            return None
 
     def add_repair_work(self, x: int, y: int):
-        """添加修复任务"""
+        """添加修复任务（使用绝对坐标）"""
         with self.lock:
             img_x = x - self.offset_x
             img_y = y - self.offset_y
             if 0 <= img_x < self.width and 0 <= img_y < self.height:
-                self.repair_queue.append((img_x, img_y))
-                self.repair_count += 1
-
-    def mark_initial_complete(self, x: int, y: int):
-        """标记初始绘制完成（在扫描线模式下优化）"""
-        # 在扫描线模式下，我们按顺序处理，不需要单独标记
-        pass
+                # 检查是否已经在队列中
+                if (img_x, img_y) not in self.repair_queue and (img_x, img_y) not in self.work_queue:
+                    self.repair_queue.append((img_x, img_y))
+                    self.repair_count += 1
 
     def get_progress(self) -> Tuple[int, int, int]:
         """获取进度：初始完成数，总初始数，修复数"""
@@ -373,27 +403,28 @@ class ImagePainter:
         self.offset_y = offset_y
         self.mode = mode  # "scanline" 或 "random"
         
-        # 全局速率限制器
-        self.rate_limiter = RateLimiter()
+        # 账户管理器（使用所有凭证）
+        self.account_manager = AccountManager(USER_CREDENTIALS)
         
         self.write_clients = []
         self.readonly_client = None
         self.image_data: Optional[np.ndarray] = None
         self.scheduler: Optional[WorkScheduler] = None
-        self.workers_status = [0] * 5 
         self.current_board = None
         self.running = False
         self.repair_interval = 3  # 修复检查间隔（秒）
         self.last_repair_check = 0
-        self.batch_size = 500  # 每批处理的像素数量，优化为接近32KB限制
+        self.batch_size = 1  # 每次只发送一个点（受冷却限制）
         
         # 初始化客户端
-        for i in range(5):
-            uid, access_key = USER_CREDENTIALS[i % len(USER_CREDENTIALS)]
-            self.write_clients.append(PaintBoardClient(uid, access_key, "writeonly", self.rate_limiter))
+        for i in range(self.account_manager.get_total_accounts() - 1):
+            uid, access_key = USER_CREDENTIALS[i]
+            client = PaintBoardClient(uid, access_key, "writeonly", self.account_manager)
+            self.write_clients.append(client)
             
-        uid, access_key = USER_CREDENTIALS[5 % len(USER_CREDENTIALS)]
-        self.readonly_client = PaintBoardClient(uid, access_key, "readonly", self.rate_limiter)
+        # 最后一个账户用于只读
+        uid, access_key = USER_CREDENTIALS[-1]
+        self.readonly_client = PaintBoardClient(uid, access_key, "readonly", self.account_manager)
             
     def load_image(self):
         try:
@@ -406,14 +437,13 @@ class ImagePainter:
                 ratio = min(max_width / img_width, max_height / img_height)
                 new_width = int(img_width * ratio)
                 new_height = int(img_height * ratio)
-                resample_filter = Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS # type: ignore
+                resample_filter = Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS
                 img = img.resize((new_width, new_height), resample_filter)
                 logger.info(f"图片已调整大小 {img_width}x{img_height} → {new_width}x{new_height}")
             else:
                 logger.info(f"图片大小 {img_width}x{img_height} 保持不变")
                 
             self.image_data = np.array(img)
-            self.scheduler = WorkScheduler(self.image_data, self.offset_x, self.offset_y, self.mode)
             logger.info(f"加载图片成功: {img.width}x{img.height} @ ({self.offset_x}, {self.offset_y})")
             logger.info(f"工作模式: {'扫描线模式' if self.mode == 'scanline' else '随机撒点模式'}")
             return True
@@ -454,7 +484,11 @@ class ImagePainter:
         
         # 优化：随机采样检查，而不是全量检查
         sample_rate = 0.1  # 10%采样率
-        sample_indices = random.sample(range(height * width), int(height * width * sample_rate))
+        total_pixels = height * width
+        if total_pixels == 0:
+            return
+            
+        sample_indices = random.sample(range(total_pixels), min(int(total_pixels * sample_rate), 1000))
         
         for idx in sample_indices:
             y = idx // width
@@ -489,39 +523,53 @@ class ImagePainter:
                 logger.error(f"持续修复任务异常: {e}")
                 await asyncio.sleep(5)
 
-    async def paint_chunk(self, client: PaintBoardClient, coords: List[Tuple[int, int, int, int, int]]):
-        """绘制一个工作块"""
-        for x, y, r, g, b in coords:
-            await client.send_paint_data(x, y, r, g, b)
-        
-        # 批量发送，利用速率限制
-        await client.flush_messages()
-
-    async def write_worker(self, worker_id: int):
-        """写入工作线程"""
-        client = self.write_clients[worker_id]
-        if not client.connected:
-            await client.connect_websocket()
-            
+    async def send_task(self):
+        """发送任务：使用账户管理器分配工作"""
         while self.running:
-            if self.scheduler is None:
-                await asyncio.sleep(0.05)
-                continue
-            
-            # 动态调整优先级：如果有修复任务，优先处理
-            repair_priority = self.scheduler.repair_count > 50
-            coords = self.scheduler.get_work_chunk(self.batch_size, repair_priority)
-            
-            if not coords:
-                # 如果没有工作，检查是否需要等待
-                if not self.scheduler.has_work():
+            try:
+                # 获取可用账户
+                account = self.account_manager.get_available_account()
+                if not account:
+                    # 计算最小等待时间
+                    min_wait = min(
+                        max(0, 30 - (time.time() - acc['last_used'])) 
+                        for acc in self.account_manager.accounts
+                    )
+                    await asyncio.sleep(min_wait + 0.1)
+                    continue
+                
+                # 获取客户端
+                client = None
+                for c in self.write_clients:
+                    if c.uid == account['uid']:
+                        client = c
+                        break
+                
+                # 确保客户端连接
+                if not client or not await client.ensure_connected():
+                    self.account_manager.release_account(account['uid'])
+                    await asyncio.sleep(1)
+                    continue
+                
+                # 获取工作点
+                point = self.scheduler.get_next_work() if self.scheduler else None
+                if not point:
+                    # 没有工作，释放账户
+                    self.account_manager.release_account(account['uid'])
                     await asyncio.sleep(0.5)
-                continue
-            
-            self.workers_status[worker_id] = len(coords)
-            await self.paint_chunk(client, coords)
-            await client.listen_messages()
-            await asyncio.sleep(0.01)  # 减少休眠时间，提高效率
+                    continue
+                
+                x, y, r, g, b = point
+                paint_id = await client.send_paint_data(x, y, r, g, b)
+                if paint_id is not None:
+                    await client.flush_messages()
+                
+                # 短暂休眠避免忙等
+                await asyncio.sleep(0)
+                
+            except Exception as e:
+                logger.error(f"发送任务异常: {e}")
+                await asyncio.sleep(1)
 
     async def readonly_worker(self):
         """只读工作线程，用于监听画板变化"""
@@ -538,14 +586,20 @@ class ImagePainter:
     async def progress_reporter(self):
         """进度报告器"""
         phase = "初始绘制"
+        last_report = 0
         while self.running:
             if self.scheduler is None:
                 await asyncio.sleep(2)
                 continue
             
+            current_time = time.time()
+            if current_time - last_report < 2:
+                await asyncio.sleep(0.5)
+                continue
+                
             initial_completed, total_initial, repair_count = self.scheduler.get_progress()
             initial_progress = (initial_completed / total_initial * 100) if total_initial > 0 else 0
-            active_workers = sum(1 for status in self.workers_status if status > 0)
+            active_accounts = sum(1 for acc in self.account_manager.accounts if acc['cooling']) if self.account_manager else 0
             
             # 更新阶段显示
             if self.scheduler.is_initial_complete():
@@ -555,31 +609,49 @@ class ImagePainter:
             
             mode_display = "随机撒点" if self.mode == "random" else "扫描线"
             logger.info(f"[{phase}][{mode_display}] 初始进度: {initial_completed}/{total_initial} ({initial_progress:.1f}%) - "
-                       f"修复任务: {repair_count} - 活动进程: {active_workers}/5")
+                       f"修复任务: {repair_count} - 活动账户: {active_accounts}/{self.account_manager.get_total_accounts()-1}")
             
-            await asyncio.sleep(2)
+            last_report = current_time
+            await asyncio.sleep(0.5)
 
     async def run(self):
         """运行绘画任务"""
         if not self.load_image():
             return False
             
-        logger.info("启动绘图任务：5个写入线程 + 1个只读线程 + 1个修复线程")
+        # 获取初始画板状态
+        board = await self.get_board_state()
+        if board is None:
+            logger.error("无法获取初始画板状态，退出")
+            return False
+            
+        # 创建工作调度器
+        self.scheduler = WorkScheduler(
+            self.image_data, 
+            board, 
+            self.offset_x, 
+            self.offset_y, 
+            self.mode
+        )
+        
+        # 设置工作调度器给所有客户端
+        for client in self.write_clients:
+            client.work_scheduler = self.scheduler
+        
+        logger.info(f"启动绘图任务：{self.account_manager.get_total_accounts()-1}个写入账户 + 1个只读账户")
         logger.info(f"图像偏移: ({self.offset_x}, {self.offset_y})")
         logger.info(f"工作模式: {'扫描线模式' if self.mode == 'scanline' else '随机撒点模式'}")
-        logger.info(f"速率限制: 256包/秒，每包最大32KB")
+        logger.info(f"账户限制: 每个账户每30秒1个点，总速率: {self.account_manager.get_total_accounts()-1}点/30秒")
+        logger.info(f"需要绘制的像素: {self.scheduler.total_initial_pixels}")
         
-        # 获取初始画板状态
-        await self.get_board_state()
         self.running = True
         tasks = []
         
         try:
             # 启动所有工作线程
-            for i in range(5):
-                tasks.append(asyncio.create_task(self.write_worker(i)))
+            tasks.append(asyncio.create_task(self.send_task()))
             tasks.append(asyncio.create_task(self.readonly_worker()))
-            tasks.append(asyncio.create_task(self.continuous_repair())) 
+            tasks.append(asyncio.create_task(self.continuous_repair()))
             tasks.append(asyncio.create_task(self.progress_reporter()))
             
             await asyncio.gather(*tasks)
@@ -594,13 +666,14 @@ class ImagePainter:
 
 def print_banner():
     print("=" * 60)
-    print("                    GenGen Painter (优化版)")
+    print("                    GenGen Painter (冷却优化版)")
     print("=" * 60)
     print("新限制优化:")
-    print("  • 每秒256包限制")
-    print("  • 每包32KB大小限制")
+    print("  • 每个账户每30秒只能绘制1个点")
+    print("  • 动态适应账户数量 (当前可用账户: {}个)".format(len(USER_CREDENTIALS)))
     print("  • 扫描线模式: 高效顺序绘制")
     print("  • 随机撒点模式: 快速覆盖")
+    print("  • 智能修复: 自动检测并修复被覆盖像素")
     print("=" * 60)
 
 def get_user_input():
@@ -636,7 +709,7 @@ async def main():
     image_path, offset_x, offset_y, mode = get_user_input()
     painter = ImagePainter(image_path, offset_x, offset_y, mode)
     print("\n开始绘制...")
-    print("程序将同时进行初始绘制和实时修复")
+    print(f"程序将使用 {len(USER_CREDENTIALS)-1} 个账户轮流绘制 (每账户30秒1点)")
     print("按 Ctrl+C 停止程序\n")
     try:
         await painter.run()
@@ -655,5 +728,3 @@ if __name__ == "__main__":
         asyncio.run(painter.run())
     else:
         asyncio.run(main())
-
-
