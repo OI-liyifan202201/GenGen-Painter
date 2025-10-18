@@ -17,7 +17,7 @@ import random
 import math
 
 # 配置日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')https://bgithub.xyz
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://paintboard.luogu.me"
@@ -655,4 +655,5 @@ if __name__ == "__main__":
         asyncio.run(painter.run())
     else:
         asyncio.run(main())
+
 
