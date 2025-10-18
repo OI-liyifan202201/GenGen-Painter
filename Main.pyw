@@ -1,602 +1,657 @@
+import asyncio
+import websockets
+import websockets.protocol 
+import json
+import threading
+import time
+import struct
+import requests
+import logging
+from PIL import Image
+import numpy as np
+from collections import deque
+from typing import List, Tuple, Optional, Dict
 import sys
 import os
-import subprocess
-import json
-import logging
-import numpy as np
-import re
-import tempfile
-from PIL import Image
-from collections import deque
-from typing import Optional, Tuple
-from enum import Enum
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QLabel, QPushButton, QComboBox,
-                             QSpinBox, QTextEdit, QGroupBox,
-                             QFileDialog, QProgressBar, QMessageBox, QFrame)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QSize, QProcess, QObject, QRect
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor
+import random
+import math
 
-from qfluentwidgets import (PrimaryPushButton, ComboBox, SpinBox,
-                            ProgressBar, TextEdit, TitleLabel,
-                            BodyLabel, CaptionLabel, StrongBodyLabel)
-HAS_FLUENT = True
-
-# Configure logging
+# 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://paintboard.luogu.me"
+WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
-PROGRESS_PATTERN = re.compile(
-    r".*初始进度:\s*(\d+)/(\d+)\s*\((\d+(?:\.\d+)?)%\)\s*- 修复任务:\s*(\d+)\s*- 活动进程:\s*(\d+)/(\d+)"
-)
+# UID和Access Key对应表
+USER_CREDENTIALS = [
+    (661094, "lDrv8W9u"), (661913, "lFT03zMS"), (1351126, "UJUVuzyk"), 
+    (1032267, "6XF2wDhG"), (1404345, "dJvxSGv6"), (1036010, "hcB8wQzm"), 
+    (703022, "gJNV9lrN"), (1406692, "0WMtD3G7"), (1058607, "iyuq7QA2"), 
+    (1276209, "vzciwZs7"), (1227240, "WwnnjHVP"), (1406674, "NtqPbU8t")
+]
 
-class PaintMode(Enum):
-    LINE_SCAN = "扫描线"
-    RANDOM_DOT = "多线程随机撒点"
-
-    def to_int(self) -> int:
-        return {PaintMode.LINE_SCAN: 0, PaintMode.RANDOM_DOT: 1}[self]
-
-class ConsoleRunner(QThread):
-    output_received = pyqtSignal(str)
-    finished = pyqtSignal(int)
-
-    def __init__(self, cmd: list, temp_file: Optional[str] = None):
-        super().__init__()
-        self.cmd = cmd
-        self.temp_file = temp_file  # 用于后续清理
-        self.process = None
-
-    def run(self):
-        logger.info(f"Running command: {' '.join(self.cmd)}")
-        self.process = subprocess.Popen(
-            self.cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        try:
-            for line in iter(self.process.stdout.readline, ''):
-                if line:
-                    self.output_received.emit(line.rstrip())
-            self.process.stdout.close()
-            exit_code = self.process.wait()
-            self.finished.emit(exit_code)
-        except Exception as e:
-            self.output_received.emit(f"[ERROR] Subprocess failed: {e}")
-            self.finished.emit(-1)
-
-    def stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-
-    def cleanup_temp(self):
-        if self.temp_file and os.path.exists(self.temp_file):
-            try:
-                os.remove(self.temp_file)
-            except Exception as e:
-                logger.warning(f"Failed to remove temp file {self.temp_file}: {e}")
-
-class CanvasWidget(QWidget):
-    image_moved = pyqtSignal(int, int)
-
+class RateLimiter:
+    """速率限制器，确保每秒不超过256包"""
     def __init__(self):
-        super().__init__()
-        self.setMinimumSize(500, 300)
-        self.board_img = None
-        self.user_img_original = None  # PIL Image, 原始
-        self.user_img_display = None   # QPixmap, 用于显示
-        self.offset_x = 0
-        self.offset_y = 0
-        self.user_scale = 1.0
-        self.scale = 0.5
-        self.board_data = None
-
-        self.dragging = False
-        self.drag_start_pos = None
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-
-    def set_board_image(self, img_data: np.ndarray):
-        if img_data is not None:
-            try:
-                self.board_data = img_data
-                h, w = img_data.shape[:2]
-                img_data_contiguous = np.ascontiguousarray(img_data)
-                q_img = QImage(img_data_contiguous.data, w, h, 3 * w, QImage.Format.Format_RGB888)
-                self.board_img = QPixmap.fromImage(q_img)
-                self.update()
-            except Exception as e:
-                logger.error(f"Error setting board image: {e}")
-
-    def set_user_image(self, img: Image.Image, ox: int, oy: int, scale: float = 1.0):
-        if img:
-            self.user_img_original = img.copy()
-            self.user_scale = max(0.1, min(5.0, scale))
-            # 限制 offset 在有效范围内
-            img_w, img_h = img.size
-            scaled_w = int(img_w * self.user_scale)
-            scaled_h = int(img_h * self.user_scale)
-            max_x = max(0, 1000 - scaled_w)
-            max_y = max(0, 600 - scaled_h)
-            self.offset_x = max(0, min(ox, max_x))
-            self.offset_y = max(0, min(oy, max_y))
-            self._update_user_display()
-            self.update()
-
-    def _update_user_display(self):
-        if self.user_img_original is None:
-            self.user_img_display = None
-            return
-        w0, h0 = self.user_img_original.size
-        new_w = int(w0 * self.user_scale)
-        new_h = int(h0 * self.user_scale)
-        if new_w < 1 or new_h < 1:
-            self.user_img_display = None
-            return
-        resized_img = self.user_img_original.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        if resized_img.mode != 'RGB':
-            resized_img = resized_img.convert('RGB')
-        img_array = np.array(resized_img)
-        q_img = QImage(img_array.tobytes(), new_w, new_h, 3 * new_w, QImage.Format.Format_RGB888)
-        self.user_img_display = QPixmap.fromImage(q_img)
-
-    def _get_board_rect(self):
-        aw, ah = self.width(), self.height()
-        sx, sy = aw / 1000.0, ah / 600.0
-        self.scale = min(sx, sy, 1.0)
-        bw, bh = 1000 * self.scale, 600 * self.scale
-        bx, by = (aw - bw) / 2, (ah - bh) / 2
-        return bx, by, bw, bh
-
-    def _get_user_image_rect(self, board_x, board_y):
-        if not self.user_img_display:
-            return None
-        uw = self.user_img_display.width() * self.scale
-        uh = self.user_img_display.height() * self.scale
-        scaled = self.user_img_display.scaled(
-            int(uw), int(uh),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        actual_w, actual_h = scaled.width(), scaled.height()
-        ux = board_x + self.offset_x * self.scale - (actual_w - uw) / 2
-        uy = board_y + self.offset_y * self.scale - (actual_h - uh) / 2
-        return QRect(int(ux), int(uy), actual_w, actual_h)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.fillRect(self.rect(), QColor(240, 240, 240))
-
-        board_x, board_y, board_width, board_height = self._get_board_rect()
-        painter.fillRect(int(board_x), int(board_y), int(board_width), int(board_height), Qt.GlobalColor.white)
-
-        if self.board_img:
-            scaled_board = self.board_img.scaled(
-                int(board_width), int(board_height),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
-            dx = (board_width - scaled_board.width()) / 2
-            dy = (board_height - scaled_board.height()) / 2
-            painter.drawPixmap(int(board_x + dx), int(board_y + dy), scaled_board)
-
-        if self.user_img_display:
-            uw = self.user_img_display.width() * self.scale
-            uh = self.user_img_display.height() * self.scale
-            scaled_user = self.user_img_display.scaled(
-                int(uw), int(uh),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
-            actual_w, actual_h = scaled_user.width(), scaled_user.height()
-            ux = board_x + self.offset_x * self.scale - (actual_w - uw) / 2
-            uy = board_y + self.offset_y * self.scale - (actual_h - uh) / 2
-
-            painter.setOpacity(0.7)
-            painter.drawPixmap(int(ux), int(uy), scaled_user)
-            painter.setOpacity(1.0)
-            painter.setPen(QPen(QColor(255, 0, 0), 2))
-            painter.drawRect(int(ux), int(uy), actual_w, actual_h)
-
-        # Grid
-        painter.setPen(QPen(QColor(200, 200, 200), 1))
-        for x in range(0, 1001, 200):
-            line_x = board_x + x * self.scale
-            painter.drawLine(int(line_x), int(board_y), int(line_x), int(board_y + board_height))
-        for y in range(0, 601, 200):
-            line_y = board_y + y * self.scale
-            painter.drawLine(int(board_x), int(line_y), int(board_x + board_width), int(line_y))
-
-    def wheelEvent(self, event):
-        delta = event.angleDelta().y()
-        self.scale *= 1.1 if delta > 0 else 0.9
-        self.scale = max(0.1, min(2.0, self.scale))
-        self.update()
-
-    def mousePressEvent(self, event):
-        pos = event.pos()
-        board_x, board_y, _, _ = self._get_board_rect()
-        user_rect = self._get_user_image_rect(board_x, board_y)
-
-        if user_rect and user_rect.contains(pos):
-            self.dragging = True
-            self.drag_start_pos = pos
-            self.orig_offset = (self.offset_x, self.offset_y)
-            event.accept()
-            return
-
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self.dragging and self.drag_start_pos:
-            pos = event.pos()
-            board_x, board_y, _, _ = self._get_board_rect()
-            dx = (pos.x() - self.drag_start_pos.x()) / self.scale
-            dy = (pos.y() - self.drag_start_pos.y()) / self.scale
-            new_ox = int(self.orig_offset[0] + dx)
-            new_oy = int(self.orig_offset[1] + dy)
-
-            # ✅ 正确计算边界：使用原始图像尺寸和当前缩放
-            if self.user_img_original:
-                orig_w, orig_h = self.user_img_original.size
-                scaled_w = int(orig_w * self.user_scale)
-                scaled_h = int(orig_h * self.user_scale)
-                max_x = max(0, 1000 - scaled_w)
-                max_y = max(0, 600 - scaled_h)
-                new_ox = max(0, min(new_ox, max_x))
-                new_oy = max(0, min(new_oy, max_y))
-
-            self.offset_x = new_ox
-            self.offset_y = new_oy
-            self.image_moved.emit(new_ox, new_oy)
-            self.update()
-        event.accept()
-
-    def mouseReleaseEvent(self, event):
-        self.dragging = False
-        self.drag_start_pos = None
-        event.accept()
-
-
-class BoardMonitor(QThread):
-    board_updated = pyqtSignal(np.ndarray)
-
-    def __init__(self):
-        super().__init__()
-        self.running = False
-        self.update_interval = 1
-
-    def run(self):
-        self.running = True
-        import requests
-        while self.running:
-            try:
-                response = requests.get(f"{API_BASE_URL}/api/paintboard/getboard", timeout=10)
-                if response.status_code == 200:
-                    data = response.content
-                    if len(data) == 1000 * 600 * 3:
-                        board = np.frombuffer(data, dtype=np.uint8).reshape((600, 1000, 3))
-                        self.board_updated.emit(board)
-            except Exception as e:
-                logger.error(f"Board monitor error: {e}")
-
-            for _ in range(self.update_interval * 10):
-                if not self.running:
+        self.packets_per_second = 256
+        self.packet_times = deque()
+        self.lock = threading.Lock()
+        
+    async def acquire(self):
+        """获取发送许可"""
+        while True:
+            with self.lock:
+                now = time.time()
+                # 移除超过1秒的时间戳
+                while self.packet_times and now - self.packet_times[0] > 1.0:
+                    self.packet_times.popleft()
+                
+                # 检查是否达到限制
+                if len(self.packet_times) < self.packets_per_second:
+                    self.packet_times.append(now)
                     return
-                self.msleep(100)
+            
+            # 等待一段时间再检查
+            await asyncio.sleep(0.001)
 
-    def stop(self):
-        self.running = False
-
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("GenGen Painter")
-        self.setMinimumSize(1200, 800)
-
-        self.current_image_path = None
-        self.offset_x = 0
-        self.offset_y = 0
-        self.user_image_scale = 1.0
-        self.console_runner = None
-        self.board_monitor = BoardMonitor()
-
-        self.setup_ui()
-        self.setup_connections()
-        self.board_monitor.start()
-
-    def setup_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QHBoxLayout(central_widget)
-
-        left_panel = QWidget()
-        left_panel.setMaximumWidth(350)
-        left_layout = QVBoxLayout(left_panel)
-
-        img_group = QGroupBox("图像设置")
-        img_layout = QVBoxLayout(img_group)
-        self.btn_load = PrimaryPushButton("上传图片")
-        img_layout.addWidget(self.btn_load)
-
-        img_layout.addWidget(StrongBodyLabel("位置调整:"))
-        pos_layout = QHBoxLayout()
-        pos_layout.addWidget(BodyLabel("X:"))
-        self.spin_x = SpinBox()
-        self.spin_x.setRange(0, 1000)
-        pos_layout.addWidget(self.spin_x)
-        pos_layout.addWidget(BodyLabel("Y:"))
-        self.spin_y = SpinBox()
-        self.spin_y.setRange(0, 600)
-        pos_layout.addWidget(self.spin_y)
-        img_layout.addLayout(pos_layout)
-
-        scale_layout = QHBoxLayout()
-        scale_layout.addWidget(BodyLabel("缩放:"))
-        self.spin_scale = SpinBox()
-        self.spin_scale.setRange(10, 500)   # 0.1 ~ 5.0
-        self.spin_scale.setValue(100)       # 1.0
-        self.spin_scale.setSingleStep(10)   # 0.1 步长
-        scale_layout.addWidget(self.spin_scale)
-        img_layout.addLayout(scale_layout)
-
-        self.btn_refresh = PrimaryPushButton("手动刷新画板")
-        img_layout.addWidget(self.btn_refresh)
-        left_layout.addWidget(img_group)
-
-        paint_group = QGroupBox("绘画设置")
-        paint_layout = QVBoxLayout(paint_group)
-        paint_layout.addWidget(StrongBodyLabel("绘画模式:"))
-        self.combo_mode = ComboBox()
-        self.combo_mode.addItems([mode.value for mode in PaintMode])
-        paint_layout.addWidget(self.combo_mode)
-        self.btn_start = PrimaryPushButton("开始绘画")
-        self.btn_stop = PrimaryPushButton("停止绘画")
-        self.btn_stop.setEnabled(False)
-        btn_layout = QHBoxLayout()
-        btn_layout.addWidget(self.btn_start)
-        btn_layout.addWidget(self.btn_stop)
-        paint_layout.addLayout(btn_layout)
-        left_layout.addWidget(paint_group)
-
-        progress_group = QGroupBox("进度")
-        progress_layout = QVBoxLayout(progress_group)
-        self.label_status = BodyLabel("就绪")
-        self.progress_bar = ProgressBar()
-        self.progress_bar.setRange(0, 100)
-        progress_layout.addWidget(self.label_status)
-        progress_layout.addWidget(self.progress_bar)
-        left_layout.addWidget(progress_group)
-
-        info_group = QGroupBox("说明")
-        info_layout = QVBoxLayout(info_group)
-        info_text = QLabel(
-            "• 上传图片后可拖动调整位置\n"
-            "• 缩放比例通过输入框设置（0.1~5.0）\n"
-            "• 点击“开始绘画”将调用:\n"
-            "  python Console.py [缩放后图片] [X] [Y] [模式]\n"
-            "• 模式: 0=逐行, 1=随机\n"
-            "• 画板每秒自动刷新"
-        )
-        info_text.setWordWrap(True)
-        info_layout.addWidget(info_text)
-        left_layout.addWidget(info_group)
-
-        log_group = QGroupBox("日志输出")
-        log_layout = QVBoxLayout(log_group)
-        self.text_log = TextEdit()
-        self.text_log.setReadOnly(True)
-        log_layout.addWidget(self.text_log)
-        left_layout.addWidget(log_group)
-        left_layout.addStretch()
-
-        self.canvas = CanvasWidget()
-        layout.addWidget(left_panel)
-        layout.addWidget(self.canvas, 1)
-
-    def setup_connections(self):
-        self.btn_load.clicked.connect(self.load_image)
-        self.btn_start.clicked.connect(self.start_painting)
-        self.btn_stop.clicked.connect(self.stop_painting)
-        self.btn_refresh.clicked.connect(self.refresh_board)
-        self.spin_x.valueChanged.connect(self.update_offset_from_spin)
-        self.spin_y.valueChanged.connect(self.update_offset_from_spin)
-        self.spin_scale.valueChanged.connect(self.update_scale_from_spin)
-        self.board_monitor.board_updated.connect(self.canvas.set_board_image)
-        self.canvas.image_moved.connect(self.on_image_moved)
-
-    def on_image_moved(self, ox, oy):
-        self.offset_x = ox
-        self.offset_y = oy
-        self.spin_x.setValue(ox)
-        self.spin_y.setValue(oy)
-
-    def load_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择图片", "", "Images (*.png *.jpg *.jpeg *.bmp)"
-        )
-        if path:
-            self.current_image_path = path
-            try:
-                img = Image.open(path).convert('RGB')
-                self.user_image_scale = 1.0
-                self.spin_scale.setValue(100)
-                self.canvas.set_user_image(img, 0, 0, 1.0)  # 初始位置设为 (0,0)
-                w, h = img.size
-                self.log_info(f"加载图片: {w}x{h}")
-            except Exception as e:
-                self.log_error(f"加载图片失败: {e}")
-
-    def refresh_board(self):
-        self.log_info("手动刷新画板...")
-        import requests
+class PaintBoardClient:
+    def __init__(self, uid: int, access_key: str, connection_type: str = "readwrite", rate_limiter: Optional[RateLimiter] = None):
+        self.uid = uid
+        self.access_key = access_key
+        self.connection_type = connection_type
+        self.rate_limiter = rate_limiter
+        self.token: Optional[str] = None
+        self.websocket: Optional[websockets.WebSocketClientProtocol] = None # type: ignore
+        self.connected = False
+        self.message_queue = deque()
+        self.paint_id_counter = 0
+        self.last_heartbeat = time.time()
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 100
+        self.packet_size_limit = 32000  # 32KB限制
+        
+    async def get_token(self):
+        """获取Token"""
         try:
-            response = requests.get(f"{API_BASE_URL}/api/paintboard/getboard", timeout=10)
+            logger.info(f"用户 {self.uid} 正在获取 Token...")
+            url = f"{API_BASE_URL}/api/auth/gettoken"
+            payload = {"uid": self.uid, "access_key": self.access_key}
+            response = requests.post(url, json=payload)
+            result = response.json()
+            
+            if "data" in result:
+                self.token = result["data"]["token"]
+                logger.info(f"用户 {self.uid} 获取 Token 成功")
+                return True
+            else:
+                logger.error(f"用户 {self.uid} 获取 Token 失败: {result.get('errorType', 'Unknown error')}")
+                return False
+        except Exception as e:
+            logger.error(f"用户 {self.uid} 获取 Token 异常: {e}")
+            return False
+
+    async def connect_websocket(self):
+        """连接WebSocket"""
+        if not self.token:
+            if not await self.get_token():
+                return False
+                
+        try:
+            url = WEBSOCKET_URL
+            if self.connection_type == "readonly":
+                url += "?readonly=1"
+            elif self.connection_type == "writeonly":
+                url += "?writeonly=1"
+                
+            self.websocket = await websockets.connect(url)
+            self.connected = True
+            self.reconnect_attempts = 0
+            logger.info(f"用户 {self.uid} 连接 WebSocket 成功 ({self.connection_type})")
+            return True
+        except Exception as e:
+            logger.error(f"用户 {self.uid} 连接 WebSocket 失败: {e}")
+            self.connected = False
+            return False
+
+    async def ensure_connected(self):
+        """确保连接正常，必要时重连"""
+        if not self.connected or self.websocket is None:
+            if self.reconnect_attempts < self.max_reconnect_attempts:
+                self.reconnect_attempts += 1
+                logger.info(f"正在尝试重新连接 ({self.reconnect_attempts}/{self.max_reconnect_attempts}) 为用户 {self.uid}")
+                return await self.connect_websocket()
+            else:
+                logger.error(f"用户 {self.uid} 达到最大重连次数")
+                return False
+
+        if self.websocket.state == websockets.protocol.State.CLOSED:
+            self.connected = False
+            return await self.ensure_connected()
+
+        return True
+
+    async def send_heartbeat(self):
+        """发送心跳包"""
+        if await self.ensure_connected() and self.websocket:
+            try:
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+                await self.websocket.send(bytes([0xfb]))
+                self.last_heartbeat = time.time()
+            except Exception as e:
+                logger.error(f"用户 {self.uid} 发送心跳失败: {e}")
+                self.connected = False
+
+    async def send_paint_data(self, x: int, y: int, r: int, g: int, b: int):
+        """发送绘画数据"""
+        if not await self.ensure_connected() or self.token is None:
+            return None
+            
+        try:
+            paint_id = self.paint_id_counter
+            self.paint_id_counter = (self.paint_id_counter + 1) % 4294967296
+            
+            packet = bytearray()
+            packet.append(0xfe)
+            packet.extend(struct.pack('<H', x))
+            packet.extend(struct.pack('<H', y))
+            packet.append(r)
+            packet.append(g)
+            packet.append(b)
+            packet.extend(struct.pack('<I', self.uid)[:3])
+            
+            token_clean = self.token.replace('-', '')
+            token_bytes = bytes.fromhex(token_clean)
+            packet.extend(token_bytes)
+            packet.extend(struct.pack('<I', paint_id))
+            
+            self.message_queue.append(packet)
+            return paint_id
+        except Exception as e:
+            logger.error(f"用户 {self.uid} 准备绘图数据失败: {e}")
+            return None
+
+    async def flush_messages(self):
+        """发送所有排队的消息（考虑32KB包大小限制）"""
+        if not await self.ensure_connected() or len(self.message_queue) == 0 or self.websocket is None:
+            return
+            
+        try:
+            # 按照32KB限制分批发送
+            current_batch = bytearray()
+            batches = []
+            
+            for msg in self.message_queue:
+                if len(current_batch) + len(msg) <= self.packet_size_limit:
+                    current_batch.extend(msg)
+                else:
+                    if current_batch:
+                        batches.append(current_batch)
+                    current_batch = bytearray(msg)
+            
+            if current_batch:
+                batches.append(current_batch)
+            
+            # 发送所有批次
+            for batch in batches:
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+                await self.websocket.send(bytes(batch))
+            
+            self.message_queue.clear()
+        except Exception as e:
+            logger.error(f"用户 {self.uid} 发送消息失败: {e}")
+            self.connected = False
+
+    async def listen_messages(self):
+        """监听服务器消息"""
+        if not await self.ensure_connected() or self.websocket is None:
+            return
+            
+        try:
+            message = await asyncio.wait_for(self.websocket.recv(), timeout=0.1)
+            if isinstance(message, bytes):
+                self.process_binary_message(message)
+        except asyncio.TimeoutError:
+            pass
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(f"用户 {self.uid} 的 WebSocket 连接已关闭")
+            self.connected = False
+        except Exception as e:
+            logger.error(f"用户 {self.uid} 接收消息异常: {e}")
+
+    def process_binary_message(self, data: bytes):
+        """处理二进制消息"""
+        offset = 0
+        while offset < len(data):
+            if offset >= len(data):
+                break
+            opcode = data[offset]
+            offset += 1
+            
+            if opcode == 0xfa:  # 绘画消息
+                if offset + 7 <= len(data):
+                    x = struct.unpack('<H', data[offset:offset+2])[0]
+                    y = struct.unpack('<H', data[offset+2:offset+4])[0]
+                    r, g, b = data[offset+4], data[offset+5], data[offset+6]
+                    offset += 7
+                    logger.debug(f"收到绘图消息 ({x}, {y}): RGB({r}, {g}, {b})")
+                    
+            elif opcode == 0xfc:  # 心跳请求 (Ping)
+                asyncio.create_task(self.send_heartbeat())
+                
+            elif opcode == 0xff:  # 绘画结果
+                if offset + 5 <= len(data):
+                    paint_id = struct.unpack('<I', data[offset:offset+4])[0]
+                    status = data[offset+4]
+                    offset += 5
+                    status_messages = {
+                        0xef: "Success",
+                        0xee: "Cooling down",
+                        0xed: "Invalid token",
+                        0xec: "Bad request",
+                        0xeb: "No permission",
+                        0xea: "Server error"
+                    }
+                    status_msg = status_messages.get(status, f"Unknown status {status:02x}")
+                    logger.debug(f"绘图结果 ID {paint_id}: {status_msg}")
+                    
+            else:
+                logger.warning(f"未知操作码: {opcode:02x}")
+                break
+
+class WorkScheduler:
+    def __init__(self, image_data: np.ndarray, offset_x: int = 0, offset_y: int = 0, mode: str = "normal"):
+        self.image_data = image_data
+        self.height, self.width, _ = image_data.shape
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.mode = mode  # "scanline" 或 "random"
+        
+        # 工作负载管理
+        if mode == "scanline":
+            # 扫描线模式：按行处理
+            self.work_queue = self._create_scanline_workload()
+        else:
+            # 随机模式：随机处理
+            self.work_queue = self._create_random_workload()
+            
+        # 修复工作负载
+        self.repair_queue = deque()
+        
+        self.lock = threading.Lock()
+        self.initial_completed = 0
+        self.repair_count = 0
+        self.total_initial_pixels = self.height * self.width
+        self.last_work_time = time.time()
+        
+    def _create_scanline_workload(self):
+        """创建扫描线工作负载"""
+        queue = deque()
+        # 按行处理，每行从左到右
+        for y in range(self.height):
+            for x in range(self.width):
+                queue.append((x, y))
+        return queue
+        
+    def _create_random_workload(self):
+        """创建随机工作负载"""
+        indices = []
+        for y in range(self.height):
+            for x in range(self.width):
+                indices.append((x, y))
+        random.shuffle(indices)
+        return deque(indices)
+        
+    def get_work_chunk(self, chunk_size: int = 500, repair_priority: bool = False) -> List[Tuple[int, int, int, int, int]]:
+        """获取工作块，优化为最大包大小"""
+        with self.lock:
+            coords = []
+            
+            # 优先处理修复任务
+            if repair_priority and self.repair_queue:
+                repair_count = min(chunk_size, len(self.repair_queue))
+                for _ in range(repair_count):
+                    if self.repair_queue:
+                        x, y = self.repair_queue.popleft()
+                        r, g, b = self.image_data[y, x]
+                        actual_x = x + self.offset_x
+                        actual_y = y + self.offset_y
+                        coords.append((actual_x, actual_y, r, g, b))
+                        self.repair_count -= 1
+            
+            # 如果没有足够的修复任务，添加初始绘制任务
+            remaining = chunk_size - len(coords)
+            if remaining > 0 and self.work_queue:
+                for _ in range(remaining):
+                    if self.work_queue:
+                        x, y = self.work_queue.popleft()
+                        r, g, b = self.image_data[y, x]
+                        actual_x = x + self.offset_x
+                        actual_y = y + self.offset_y
+                        coords.append((actual_x, actual_y, r, g, b))
+                        self.initial_completed += 1
+            
+            if coords:
+                self.last_work_time = time.time()
+            return coords
+
+    def add_repair_work(self, x: int, y: int):
+        """添加修复任务"""
+        with self.lock:
+            img_x = x - self.offset_x
+            img_y = y - self.offset_y
+            if 0 <= img_x < self.width and 0 <= img_y < self.height:
+                self.repair_queue.append((img_x, img_y))
+                self.repair_count += 1
+
+    def mark_initial_complete(self, x: int, y: int):
+        """标记初始绘制完成（在扫描线模式下优化）"""
+        # 在扫描线模式下，我们按顺序处理，不需要单独标记
+        pass
+
+    def get_progress(self) -> Tuple[int, int, int]:
+        """获取进度：初始完成数，总初始数，修复数"""
+        with self.lock:
+            return self.initial_completed, self.total_initial_pixels, self.repair_count
+
+    def is_initial_complete(self) -> bool:
+        """检查初始绘制是否完成"""
+        with self.lock:
+            return self.initial_completed >= self.total_initial_pixels
+
+    def has_work(self) -> bool:
+        """检查是否有任何工作"""
+        with self.lock:
+            return bool(self.work_queue or self.repair_queue)
+
+class ImagePainter:
+    def __init__(self, image_path: str, offset_x: int = 0, offset_y: int = 0, mode: str = "scanline"):
+        self.image_path = image_path
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.mode = mode  # "scanline" 或 "random"
+        
+        # 全局速率限制器
+        self.rate_limiter = RateLimiter()
+        
+        self.write_clients = []
+        self.readonly_client = None
+        self.image_data: Optional[np.ndarray] = None
+        self.scheduler: Optional[WorkScheduler] = None
+        self.workers_status = [0] * 5 
+        self.current_board = None
+        self.running = False
+        self.repair_interval = 3  # 修复检查间隔（秒）
+        self.last_repair_check = 0
+        self.batch_size = 500  # 每批处理的像素数量，优化为接近32KB限制
+        
+        # 初始化客户端
+        for i in range(5):
+            uid, access_key = USER_CREDENTIALS[i % len(USER_CREDENTIALS)]
+            self.write_clients.append(PaintBoardClient(uid, access_key, "writeonly", self.rate_limiter))
+            
+        uid, access_key = USER_CREDENTIALS[5 % len(USER_CREDENTIALS)]
+        self.readonly_client = PaintBoardClient(uid, access_key, "readonly", self.rate_limiter)
+            
+    def load_image(self):
+        try:
+            img = Image.open(self.image_path).convert('RGB')
+            img_width, img_height = img.size
+            max_width = 1000 - self.offset_x
+            max_height = 600 - self.offset_y
+            
+            if img_width > max_width or img_height > max_height:
+                ratio = min(max_width / img_width, max_height / img_height)
+                new_width = int(img_width * ratio)
+                new_height = int(img_height * ratio)
+                resample_filter = Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS # type: ignore
+                img = img.resize((new_width, new_height), resample_filter)
+                logger.info(f"图片已调整大小 {img_width}x{img_height} → {new_width}x{new_height}")
+            else:
+                logger.info(f"图片大小 {img_width}x{img_height} 保持不变")
+                
+            self.image_data = np.array(img)
+            self.scheduler = WorkScheduler(self.image_data, self.offset_x, self.offset_y, self.mode)
+            logger.info(f"加载图片成功: {img.width}x{img.height} @ ({self.offset_x}, {self.offset_y})")
+            logger.info(f"工作模式: {'扫描线模式' if self.mode == 'scanline' else '随机撒点模式'}")
+            return True
+        except Exception as e:
+            logger.error(f"加载图片失败 {self.image_path}: {e}")
+            return False
+
+    async def get_board_state(self):
+        """获取当前画板状态"""
+        try:
+            response = requests.get(f"{API_BASE_URL}/api/paintboard/getboard")
             if response.status_code == 200:
                 data = response.content
-                if len(data) == 1000 * 600 * 3:
-                    board = np.frombuffer(data, dtype=np.uint8).reshape((600, 1000, 3))
-                    self.canvas.set_board_image(board)
-                    self.log_info("画板刷新成功")
-                else:
-                    self.log_error("画板数据大小错误")
+                expected_size = 1000 * 600 * 3
+                if len(data) != expected_size:
+                    logger.error(f"画板数据大小错误: {len(data)} != {expected_size}")
+                    return None
+
+                board = np.frombuffer(data, dtype=np.uint8).reshape((600, 1000, 3))
+                self.current_board = board
+                return board
             else:
-                self.log_error(f"HTTP {response.status_code}")
+                logger.error(f"获取画板失败: HTTP {response.status_code}")
+                return None
         except Exception as e:
-            self.log_error(f"刷新失败: {e}")
+            logger.error(f"获取画板异常: {e}")
+            return None
 
-    def update_offset_from_spin(self):
-        self.offset_x = self.spin_x.value()
-        self.offset_y = self.spin_y.value()
-        if self.current_image_path:
-            try:
-                img = Image.open(self.current_image_path).convert('RGB')
-                self.canvas.set_user_image(img, self.offset_x, self.offset_y, self.user_image_scale)
-            except Exception as e:
-                self.log_error(f"更新偏移失败: {e}")
-
-    def update_scale_from_spin(self):
-        scale = self.spin_scale.value() / 100.0
-        self.user_image_scale = max(0.1, min(5.0, scale))
-        if self.current_image_path:
-            try:
-                img = Image.open(self.current_image_path).convert('RGB')
-                self.canvas.set_user_image(img, self.offset_x, self.offset_y, self.user_image_scale)
-            except Exception as e:
-                self.log_error(f"更新缩放失败: {e}")
-
-    def start_painting(self):
-        if not self.current_image_path:
-            self.show_message("错误", "请先上传图片")
+    async def check_and_repair(self):
+        """检查并修复被修改的像素"""
+        if self.current_board is None or self.image_data is None or self.scheduler is None:
+            await self.get_board_state()
             return
+            
+        board = self.current_board
+        height, width = self.image_data.shape[:2]
+        repair_count = 0
+        
+        # 优化：随机采样检查，而不是全量检查
+        sample_rate = 0.1  # 10%采样率
+        sample_indices = random.sample(range(height * width), int(height * width * sample_rate))
+        
+        for idx in sample_indices:
+            y = idx // width
+            x = idx % width
+            board_x = x + self.offset_x
+            board_y = y + self.offset_y
+            if board_x >= 1000 or board_y >= 600:
+                continue
+            expected = self.image_data[y, x]
+            actual = board[board_y, board_x]
+            if not np.array_equal(expected, actual):
+                self.scheduler.add_repair_work(board_x, board_y)
+                repair_count += 1
+        
+        if repair_count > 0:
+            logger.info(f"采样检查发现约 {repair_count * 10} 个像素需要修复")
 
-        mode_text = self.combo_mode.currentText()
-        mode_enum = None
-        for m in PaintMode:
-            if m.value == mode_text:
-                mode_enum = m
-                break
-        if mode_enum is None:
-            self.show_message("错误", "无效模式")
+    async def continuous_repair(self):
+        """持续修复任务"""
+        while self.running:
+            try:
+                # 等待初始绘制基本完成后再开始修复
+                if self.scheduler and self.scheduler.initial_completed > self.scheduler.total_initial_pixels * 0.3:
+                    current_time = time.time()
+                    if current_time - self.last_repair_check >= self.repair_interval:
+                        await self.get_board_state()
+                        await self.check_and_repair()
+                        self.last_repair_check = current_time
+                
+                await asyncio.sleep(1)  # 短暂休眠避免过于频繁
+            except Exception as e:
+                logger.error(f"持续修复任务异常: {e}")
+                await asyncio.sleep(5)
+
+    async def paint_chunk(self, client: PaintBoardClient, coords: List[Tuple[int, int, int, int, int]]):
+        """绘制一个工作块"""
+        for x, y, r, g, b in coords:
+            await client.send_paint_data(x, y, r, g, b)
+        
+        # 批量发送，利用速率限制
+        await client.flush_messages()
+
+    async def write_worker(self, worker_id: int):
+        """写入工作线程"""
+        client = self.write_clients[worker_id]
+        if not client.connected:
+            await client.connect_websocket()
+            
+        while self.running:
+            if self.scheduler is None:
+                await asyncio.sleep(0.05)
+                continue
+            
+            # 动态调整优先级：如果有修复任务，优先处理
+            repair_priority = self.scheduler.repair_count > 50
+            coords = self.scheduler.get_work_chunk(self.batch_size, repair_priority)
+            
+            if not coords:
+                # 如果没有工作，检查是否需要等待
+                if not self.scheduler.has_work():
+                    await asyncio.sleep(0.5)
+                continue
+            
+            self.workers_status[worker_id] = len(coords)
+            await self.paint_chunk(client, coords)
+            await client.listen_messages()
+            await asyncio.sleep(0.01)  # 减少休眠时间，提高效率
+
+    async def readonly_worker(self):
+        """只读工作线程，用于监听画板变化"""
+        if self.readonly_client is None:
             return
+        client = self.readonly_client
+        if not client.connected:
+            await client.connect_websocket()
+        
+        while self.running:
+            await client.listen_messages()
+            await asyncio.sleep(0.05)  # 更频繁地监听
 
-        mode_int = mode_enum.to_int()
+    async def progress_reporter(self):
+        """进度报告器"""
+        phase = "初始绘制"
+        while self.running:
+            if self.scheduler is None:
+                await asyncio.sleep(2)
+                continue
+            
+            initial_completed, total_initial, repair_count = self.scheduler.get_progress()
+            initial_progress = (initial_completed / total_initial * 100) if total_initial > 0 else 0
+            active_workers = sum(1 for status in self.workers_status if status > 0)
+            
+            # 更新阶段显示
+            if self.scheduler.is_initial_complete():
+                phase = "维护修复"
+            elif initial_completed > total_initial * 0.8:
+                phase = "收尾绘制"
+            
+            mode_display = "随机撒点" if self.mode == "random" else "扫描线"
+            logger.info(f"[{phase}][{mode_display}] 初始进度: {initial_completed}/{total_initial} ({initial_progress:.1f}%) - "
+                       f"修复任务: {repair_count} - 活动进程: {active_workers}/5")
+            
+            await asyncio.sleep(2)
 
-        # ✅ 生成缩放后的临时图像
+    async def run(self):
+        """运行绘画任务"""
+        if not self.load_image():
+            return False
+            
+        logger.info("启动绘图任务：5个写入线程 + 1个只读线程 + 1个修复线程")
+        logger.info(f"图像偏移: ({self.offset_x}, {self.offset_y})")
+        logger.info(f"工作模式: {'扫描线模式' if self.mode == 'scanline' else '随机撒点模式'}")
+        logger.info(f"速率限制: 256包/秒，每包最大32KB")
+        
+        # 获取初始画板状态
+        await self.get_board_state()
+        self.running = True
+        tasks = []
+        
         try:
-            original_img = Image.open(self.current_image_path).convert('RGB')
-            scaled_w = int(original_img.width * self.user_image_scale)
-            scaled_h = int(original_img.height * self.user_image_scale)
-            if scaled_w < 1 or scaled_h < 1:
-                raise ValueError("缩放后图像尺寸无效")
-            scaled_img = original_img.resize((scaled_w, scaled_h), Image.Resampling.LANCZOS)
+            # 启动所有工作线程
+            for i in range(5):
+                tasks.append(asyncio.create_task(self.write_worker(i)))
+            tasks.append(asyncio.create_task(self.readonly_worker()))
+            tasks.append(asyncio.create_task(self.continuous_repair())) 
+            tasks.append(asyncio.create_task(self.progress_reporter()))
+            
+            await asyncio.gather(*tasks)
+        except KeyboardInterrupt:
+            logger.info("收到中断信号，正在关闭...")
+        finally:
+            self.running = False
+            for task in tasks:
+                task.cancel()
+        logger.info("绘画任务结束")
+        return True
 
-            # 创建临时文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp:
-                temp_path = tmp.name
-            scaled_img.save(temp_path, 'PNG')
-        except Exception as e:
-            self.log_error(f"生成缩放图像失败: {e}")
-            return
+def print_banner():
+    print("=" * 60)
+    print("                    GenGen Painter (优化版)")
+    print("=" * 60)
+    print("新限制优化:")
+    print("  • 每秒256包限制")
+    print("  • 每包32KB大小限制")
+    print("  • 扫描线模式: 高效顺序绘制")
+    print("  • 随机撒点模式: 快速覆盖")
+    print("=" * 60)
 
-        cmd = [
-            sys.executable, "Console.py",
-            temp_path,
-            str(self.offset_x),
-            str(self.offset_y),
-            str(mode_int)
-        ]
-
-        self.console_runner = ConsoleRunner(cmd, temp_file=temp_path)
-        self.console_runner.output_received.connect(self.log_info)
-        self.console_runner.finished.connect(self.on_console_finished)
-        self.console_runner.start()
-
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.label_status.setText("运行中...")
-        self.log_info(f"启动命令: {' '.join(cmd)}")
-
-    def stop_painting(self):
-        if self.console_runner and self.console_runner.isRunning():
-            self.console_runner.stop()
-            self.console_runner.wait()
-        self.on_console_finished(-1)
-
-    def on_console_finished(self, exit_code: int):
-        if self.console_runner:
-            self.console_runner.cleanup_temp()
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        if exit_code == 0:
-            self.label_status.setText("完成")
-            self.log_info("绘画任务完成")
-        elif exit_code == -1:
-            self.label_status.setText("已停止")
-            self.log_info("任务已停止")
+def get_user_input():
+    print_banner()
+    image_path = r"c:\Users\admin\Desktop\result.jpeg"
+    if not os.path.exists(image_path):
+        print("默认路径文件不存在，请确保路径正确！")
+        sys.exit(1)
+    
+    try:
+        offset_x = int(input("请输入左上角X坐标偏移 (默认0): ") or "0")
+        offset_y = int(input("请输入左上角Y坐标偏移 (默认0): ") or "0")
+        
+        print("\n请选择工作模式:")
+        print("1. 扫描线模式 (高效顺序绘制，推荐)")
+        print("2. 随机撒点模式 (快速覆盖)")
+        mode_choice = input("请输入选择 (1 或 2, 默认1): ").strip()
+        
+        if mode_choice == "2":
+            mode = "random"
+            print("已选择: 随机撒点模式")
         else:
-            self.label_status.setText("失败")
-            self.log_error(f"任务失败 (退出码: {exit_code})")
-        self.console_runner = None
+            mode = "scanline"
+            print("已选择: 扫描线模式")
+            
+    except ValueError:
+        offset_x, offset_y = 0, 0
+        mode = "scanline"
+        
+    return image_path, offset_x, offset_y, mode
 
-    def log_info(self, msg: str):
-        match = PROGRESS_PATTERN.search(msg)
-        if match:
-            done = int(match.group(1))
-            total = int(match.group(2))
-            percent = float(match.group(3))
-            fix_tasks = int(match.group(4))
-            active = int(match.group(5))
-            max_workers = int(match.group(6))
-
-            self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(done)
-            self.label_status.setText(
-                f"进度: {done}/{total} ({percent:.1f}%) | 修复: {fix_tasks} | 进程: {active}/{max_workers}"
-            )
-            self.text_log.append(f"[INFO] {msg}")
-        else:
-            self.text_log.append(f"[INFO] {msg}")
-
-        sb = self.text_log.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def log_error(self, msg: str):
-        self.text_log.append(f"[ERROR] {msg}")
-        sb = self.text_log.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def show_message(self, title: str, content: str):
-        QMessageBox.warning(self, title, content)
-
-    def closeEvent(self, event):
-        if self.console_runner and self.console_runner.isRunning():
-            self.console_runner.stop()
-            self.console_runner.wait()
-            self.console_runner.cleanup_temp()
-        if self.board_monitor.isRunning():
-            self.board_monitor.stop()
-            self.board_monitor.wait()
-        event.accept()
-
-
-def main():
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec())
-
+async def main():
+    image_path, offset_x, offset_y, mode = get_user_input()
+    painter = ImagePainter(image_path, offset_x, offset_y, mode)
+    print("\n开始绘制...")
+    print("程序将同时进行初始绘制和实时修复")
+    print("按 Ctrl+C 停止程序\n")
+    try:
+        await painter.run()
+    except KeyboardInterrupt:
+        print("\n程序已停止")
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        image_path = sys.argv[1]
+        offset_x = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+        offset_y = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+        mode = "scanline"
+        if len(sys.argv) > 4 and sys.argv[4] == "2":
+            mode = "random"
+        painter = ImagePainter(image_path, offset_x, offset_y, mode)
+        asyncio.run(painter.run())
+    else:
+        asyncio.run(main())
