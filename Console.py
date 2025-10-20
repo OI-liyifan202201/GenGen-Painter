@@ -58,7 +58,7 @@ class AccountManager:
             current_time = time.time()
             for account in self.accounts:
                 # 如果账户未冷却或冷却已结束
-                if not account['cooling'] or (current_time - account['last_used'] >= self.cooling_time):
+                if not account['cooling'] or (current_time - account['last_used'] > self.cooling_time):
                     account['cooling'] = True
                     account['last_used'] = current_time
                     return account
@@ -97,7 +97,7 @@ class PaintBoardClient:
         self.paint_id_counter = 0
         self.last_heartbeat = time.time()
         self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 100
+        self.max_reconnect_attempts = 10000
         self.packet_size_limit = 32000  # 32KB限制
         self.outstanding_paints = {}  # paint_id -> (x, y, r, g, b)
         self.work_scheduler = None  # 用于重试
