@@ -244,7 +244,7 @@ class ImagePainter:
             logger.error(f"获取画板状态失败: {e}")
             return None
 
-        async def send_task(self, session: aiohttp.ClientSession):
+    async def send_task(self, session: aiohttp.ClientSession):
         last_log_time = 0
         while self.running:
             if self.scheduler is None:
@@ -438,5 +438,6 @@ if __name__ == "__main__":
         asyncio.run(painter.run())
     else:
         asyncio.run(main())
+
 
 
