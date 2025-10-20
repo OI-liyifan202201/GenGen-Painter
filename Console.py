@@ -119,7 +119,8 @@ class PaintBoardClient:
             return False
 
     async def ensure_connected(self, session: aiohttp.ClientSession):
-        if not self.connected or self.websocket is None:
+        if self.websocket is None or not self.websocket.open:
+            logger.info(f"[{self.uid}] 重新连接 WebSocket...")
             return await self.connect_websocket(session)
         return True
 
@@ -134,9 +135,13 @@ class PaintBoardClient:
                 self.connected = False
             await asyncio.sleep(10)
 
-    async def send_paint_data(self, x, y, r, g, b):
-        if not self.connected or self.token is None:
-            return None
+        async def send_paint_data(self, x, y, r, g, b):
+        if self.websocket is None or not self.websocket.open:
+            logger.debug(f"[{self.uid}] WebSocket 未连接或已关闭，跳过绘制 ({x},{y})")
+            return False
+        if self.token is None:
+            logger.warning(f"[{self.uid}] 无有效 token，无法绘制")
+            return False
         try:
             packet = bytearray()
             packet.append(0xfe)
@@ -145,14 +150,22 @@ class PaintBoardClient:
             packet.extend([r, g, b])
             packet.extend(struct.pack('<I', self.uid)[:3])
             token_clean = self.token.replace('-', '')
+            if len(token_clean) != 32:
+                logger.error(f"[{self.uid}] Token 长度异常: {len(token_clean)}")
+                return False
             token_bytes = bytes.fromhex(token_clean)
             packet.extend(token_bytes)
             packet.extend(struct.pack('<I', random.randint(0, 2**32-1)))
             await self.websocket.send(bytes(packet))
+            logger.debug(f"[{self.uid}] 成功绘制 ({x},{y}) -> RGB({r},{g},{b})")
             return True
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"[{self.uid}] 连接已关闭 (code={e.code}): {e.reason}")
+            self.connected = False
+            return False
         except Exception as e:
-            logger.error(f"绘制失败: {e}")
-            return None
+            logger.error(f"[{self.uid}] 绘制失败 ({x},{y}): {e}")
+            return False
 
 
 # ---------------------------
@@ -231,8 +244,8 @@ class ImagePainter:
             logger.error(f"获取画板状态失败: {e}")
             return None
 
-    async def send_task(self, session: aiohttp.ClientSession):
-        """批量调度任务：一次性分配多个点给不同账号"""
+        async def send_task(self, session: aiohttp.ClientSession):
+        last_log_time = 0
         while self.running:
             if self.scheduler is None:
                 await asyncio.sleep(1)
@@ -249,16 +262,42 @@ class ImagePainter:
                     await asyncio.sleep(0.5)
                     continue
 
-                batch = self.scheduler.get_next_batch(batch_size=3)
+                batch = self.scheduler.get_next_batch(batch_size=1)
                 if not batch:
                     self.account_manager.release_account(account['uid'], account['access_key'], account.get('token'))
+                    # 仍输出最终完成日志
+                    if time.time() - last_log_time > 5:
+                        progress = self.scheduler.done / self.scheduler.total if self.scheduler.total else 1
+                        pct = progress * 100
+                        active_accounts = sum(1 for c in self.clients if c.connected)
+                        logger.info(
+                            f"初始进度: {self.scheduler.done}/{self.scheduler.total} ({pct:.1f}%) "
+                            f"- 修复任务: {len(self.scheduler.work_queue)} "
+                            f"- 活动账户: {active_accounts}/{len(self.clients)}"
+                        )
+                        last_log_time = time.time()
                     await asyncio.sleep(0.5)
                     continue
 
+                success_count = 0
                 for (x, y, r, g, b) in batch:
-                    await client.send_paint_data(x, y, r, g, b)
+                    if await client.send_paint_data(x, y, r, g, b):
+                        success_count += 1
 
                 self.account_manager.release_account(account['uid'], account['access_key'], account.get('token'))
+
+                # 定期输出 debug 日志（每5秒）
+                if time.time() - last_log_time > 5:
+                    progress = self.scheduler.done / self.scheduler.total if self.scheduler.total else 1
+                    pct = progress * 100
+                    active_accounts = sum(1 for c in self.clients if c.connected)
+                    logger.info(
+                        f"初始进度: {self.scheduler.done}/{self.scheduler.total} ({pct:.1f}%) "
+                        f"- 修复任务: {len(self.scheduler.work_queue)} "
+                        f"- 活动账户: {active_accounts}/{len(self.clients)}"
+                    )
+                    last_log_time = time.time()
+
                 await asyncio.sleep(random.uniform(0.1, 0.5))
 
             except Exception as e:
@@ -399,3 +438,4 @@ if __name__ == "__main__":
         asyncio.run(painter.run())
     else:
         asyncio.run(main())
+
