@@ -135,7 +135,7 @@ class PaintBoardClient:
                 self.connected = False
             await asyncio.sleep(10)
 
-        async def send_paint_data(self, x, y, r, g, b):
+    async def send_paint_data(self, x, y, r, g, b):
         if self.websocket is None or not self.websocket.open:
             logger.debug(f"[{self.uid}] WebSocket 未连接或已关闭，跳过绘制 ({x},{y})")
             return False
@@ -438,4 +438,5 @@ if __name__ == "__main__":
         asyncio.run(painter.run())
     else:
         asyncio.run(main())
+
 
