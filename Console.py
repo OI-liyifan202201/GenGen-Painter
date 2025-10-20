@@ -11,6 +11,10 @@ import numpy as np
 from collections import deque
 from typing import List, Tuple, Optional, Dict
 from PIL import Image
+import sys
+import os
+import random
+import math
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -380,3 +384,4 @@ if __name__ == "__main__":
         asyncio.run(painter.run())
     else:
         asyncio.run(main())
+
