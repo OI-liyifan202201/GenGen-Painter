@@ -20,6 +20,7 @@ from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor
 from qfluentwidgets import (PrimaryPushButton, ComboBox, SpinBox,
                             ProgressBar, TextEdit, TitleLabel,
                             BodyLabel, CaptionLabel, StrongBodyLabel)
+from qfluentwidgets import setTheme, Theme
 HAS_FLUENT = True
 
 # Configure logging
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "https://paintboard.luogu.me"
 
 PROGRESS_PATTERN = re.compile(
-    r".*初始进度:\s*(\d+)/(\d+)\s*\((\d+(?:\.\d+)?)%\)\s*- 修复任务:\s*(\d+)\s*- 活动进程:\s*(\d+)/(\d+)"
+    r".*初始进度:\s*(\d+)/(\d+)\s*\((\d+(?:\.\d+)?)%\)\s*- 修复任务:\s*(\d+)\s*- 活动账户:\s*(\d+)/(\d+)"
 )
 
 class PaintMode(Enum):
@@ -272,15 +273,19 @@ class BoardMonitor(QThread):
 
     def __init__(self):
         super().__init__()
-        self.running = False
-        self.update_interval = 1
+        self._running = False
+        self.update_interval = 1  # seconds
 
     def run(self):
-        self.running = True
+        self._running = True
         import requests
-        while self.running:
+        while self._running:
             try:
-                response = requests.get(f"{API_BASE_URL}/api/paintboard/getboard", timeout=10)
+                # 使用较短的连接和读取 timeout
+                response = requests.get(
+                    f"{API_BASE_URL}/api/paintboard/getboard",
+                    timeout=(3.0, 5.0)  # (connect, read)
+                )
                 if response.status_code == 200:
                     data = response.content
                     if len(data) == 1000 * 600 * 3:
@@ -289,13 +294,15 @@ class BoardMonitor(QThread):
             except Exception as e:
                 logger.error(f"Board monitor error: {e}")
 
+            # 将长 sleep 拆分为小片段，以便快速响应 stop()
             for _ in range(self.update_interval * 10):
-                if not self.running:
+                if not self._running:
                     return
-                self.msleep(100)
+                self.msleep(100)  # 每 100ms 检查一次
 
     def stop(self):
-        self.running = False
+        self._running = False
+        # 不要在这里 wait()！
 
 
 class MainWindow(QMainWindow):
@@ -580,19 +587,35 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, title, content)
 
     def closeEvent(self, event):
+        logger.info("Closing application...")
+
+        # 停止线程（非阻塞）
         if self.console_runner and self.console_runner.isRunning():
             self.console_runner.stop()
-            self.console_runner.wait()
-            self.console_runner.cleanup_temp()
+            # 可选：启动一个定时器尝试清理，但不要阻塞主线程
+            QTimer.singleShot(100, self.console_runner.cleanup_temp)
+
         if self.board_monitor.isRunning():
             self.board_monitor.stop()
-            self.board_monitor.wait()
+            # 不要调用 .wait()！
+
+        # 允许窗口立即关闭
         event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    setTheme(Theme.LIGHT)
+
+    # 👇 添加这段：强制全局浅色背景
+    palette = app.palette()
+    palette.setColor(palette.ColorRole.Window, QColor(245, 245, 245))      # 背景色
+    palette.setColor(palette.ColorRole.Base, QColor(255, 255, 255))        # 输入框背景
+    palette.setColor(palette.ColorRole.WindowText, QColor(0, 0, 0))        # 文字颜色
+    palette.setColor(palette.ColorRole.Text, QColor(0, 0, 0))
+    app.setPalette(palette)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
