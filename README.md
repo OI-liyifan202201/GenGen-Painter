@@ -6,7 +6,7 @@
 
 ## PYPI
 
-`pip install PyQt6 PyQt6-Fluent-Widgets pillow numpy websockets requests`
+`pip install aiohttp PyQt6 PyQt6-Fluent-Widgets pillow numpy websockets requests`
 
 ## ✨ 核心特性
 
