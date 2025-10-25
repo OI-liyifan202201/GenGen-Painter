@@ -101,6 +101,10 @@ class PaintBoardClient:
             return False
 
     async def connect_websocket(self, session: aiohttp.ClientSession):
+        """
+        建立 websocket 连接。注意：不同库返回的 websocket 对象接口不同（websockets vs aiohttp）。
+        这里尝试使用 websockets.connect。即使返回的对象不是预期类型，也通过 _is_ws_open 来兼容判断。
+        """
         if not self.token:
             if not await self.get_token(session):
                 return False
@@ -110,34 +114,108 @@ class PaintBoardClient:
                 url += "?readonly=1"
             elif self.connection_type == "writeonly":
                 url += "?writeonly=1"
+            # 使用 websockets 库创建连接
             self.websocket = await websockets.connect(url)
-            self.connected = True
-            return True
+            # 设置 connected 状态基于兼容性检测
+            self.connected = self._is_ws_open()
+            logger.info(f"[{self.uid}] WebSocket 连接结果: connected={self.connected}, ws_type={type(self.websocket).__name__}")
+            return self.connected
         except Exception as e:
             logger.error(f"连接失败: {e}")
             self.connected = False
+            self.websocket = None
             return False
 
+    def _is_ws_open(self) -> bool:
+        """
+        兼容检测 websocket 是否处于“打开”状态：
+        - websockets 库的连接对象通常有 .open 属性（True 表示打开）
+        - aiohttp 的 ClientWebSocketResponse 有 .closed 属性（True 表示已关闭）
+        - 如果对象为 None 或未包含已知属性，则认为未打开
+        """
+        ws = self.websocket
+        if ws is None:
+            return False
+        try:
+            # websockets 库
+            if hasattr(ws, "open"):
+                return bool(getattr(ws, "open"))
+            # aiohttp: closed == True 表示已经关闭
+            if hasattr(ws, "closed"):
+                return not bool(getattr(ws, "closed"))
+            # fallback: 某些实现会有 state/ready 等，尽量尝试
+            state = getattr(ws, "state", None)
+            if state is not None:
+                try:
+                    s = str(state).lower()
+                    return "open" in s or "opened" in s
+                except Exception:
+                    pass
+        except Exception:
+            return False
+        return False
+
     async def ensure_connected(self, session: aiohttp.ClientSession):
-        if self.websocket is None or not self.websocket.open:
+        # 使用兼容检测代替直接访问 .open 属性
+        if not self._is_ws_open():
             logger.info(f"[{self.uid}] 重新连接 WebSocket...")
             return await self.connect_websocket(session)
         return True
 
+    async def _ws_send_bytes(self, data: bytes):
+        """
+        兼容发送二进制数据的方法：
+        - 如果是 aiohttp 的 ClientWebSocketResponse：使用 send_bytes
+        - 如果是 websockets 的 WebSocketClientProtocol：使用 send
+        - 其他实现尝试常见方法，最后抛出异常
+        """
+        ws = self.websocket
+        if ws is None:
+            raise RuntimeError("websocket is None")
+        try:
+            # aiohttp
+            if hasattr(ws, "send_bytes"):
+                await ws.send_bytes(data)
+                return
+            # websockets library and other generic implementations
+            if hasattr(ws, "send"):
+                # websockets.send 接受 bytes
+                await ws.send(data)
+                return
+            # fallback: some low-level objects might expose write or write_bytes
+            if hasattr(ws, "write"):
+                maybe = ws.write
+                if asyncio.iscoroutinefunction(maybe):
+                    await maybe(data)
+                else:
+                    maybe(data)
+                return
+            raise RuntimeError("No compatible send method on websocket object")
+        except Exception:
+            # re-raise to let caller handle and set connected flag to False
+            raise
+
     async def send_heartbeat(self):
         while True:
             try:
-                if self.connected and self.websocket:
-                    await self.websocket.send(bytes([0xfb]))
-                    self.last_heartbeat = time.time()
+                if self._is_ws_open():
+                    try:
+                        await self._ws_send_bytes(bytes([0xfb]))
+                        self.last_heartbeat = time.time()
+                    except Exception as e:
+                        logger.error(f"[{self.uid}] 心跳发送失败: {e}")
+                        self.connected = False
+                else:
+                    self.connected = False
             except Exception as e:
                 logger.error(f"心跳失败: {e}")
                 self.connected = False
             await asyncio.sleep(10)
 
     async def send_paint_data(self, x, y, r, g, b):
-        if self.websocket is None or not self.websocket.open:
+        if not self._is_ws_open():
             logger.debug(f"[{self.uid}] WebSocket 未连接或已关闭，跳过绘制 ({x},{y})")
+            self.connected = False
             return False
         if self.token is None:
             logger.warning(f"[{self.uid}] 无有效 token，无法绘制")
@@ -156,15 +234,14 @@ class PaintBoardClient:
             token_bytes = bytes.fromhex(token_clean)
             packet.extend(token_bytes)
             packet.extend(struct.pack('<I', random.randint(0, 2**32-1)))
-            await self.websocket.send(bytes(packet))
+            # 通过兼容方法发送
+            await self._ws_send_bytes(bytes(packet))
             logger.debug(f"[{self.uid}] 成功绘制 ({x},{y}) -> RGB({r},{g},{b})")
             return True
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"[{self.uid}] 连接已关闭 (code={e.code}): {e.reason}")
-            self.connected = False
-            return False
         except Exception as e:
-            logger.error(f"[{self.uid}] 绘制失败 ({x},{y}): {e}")
+            # 如果发送失败（例如底层连接关闭），标记为未连接
+            logger.warning(f"[{self.uid}] 绘制失败 ({x},{y}): {e}")
+            self.connected = False
             return False
 
 
@@ -438,6 +515,3 @@ if __name__ == "__main__":
         asyncio.run(painter.run())
     else:
         asyncio.run(main())
-
-
-
