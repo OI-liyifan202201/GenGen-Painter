@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 # 修复：移除末尾空格（关键！）
 # ---------------------------
-API_BASE_URL = "https://paintboard.luogu.me"  # ← 已修复：删除末尾空格
+API_BASE_URL = "https://paintboard.luogu.me" 
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
 USER_CREDENTIALS = [
@@ -28,7 +28,8 @@ USER_CREDENTIALS = [
     (1032267, "6XF2wDhG"), (1404345, "dJvxSGv6"), (1036010, "hcB8wQzm"),
     (703022, "gJNV9lrN"), (1406692, "0WMtD3G7"), (1058607, "iyuq7QA2"),
     (1276209, "vzciwZs7"), (1227240, "WwnnjHVP"), (1406674, "NtqPbU8t"),
-    (661984, "3BRDNLh0"), (1038207, "s3Cp6arh")
+    (661984, "3BRDNLh0"), (1038207, "s3Cp6arh"),
+    # 其余受邀保密
 ]
 
 # ---------------------------
@@ -115,12 +116,13 @@ class PaintBoardClient:
             ws = await session.ws_connect(url)
             self.websocket = ws
             self.connected = not ws.closed
-            logger.info(f"[{self.uid}] WebSocket 连接结果: connected={self.connected}, ws_type={type(ws).__name__}")
+            # logger.info(f"[{self.uid}] WebSocket 连接结果: connected={self.connected}, ws_type={type(ws).__name__}")
             return self.connected
         except Exception as e:
-            logger.error(f"[{self.uid}] 连接失败: {e}")
+            # logger.error(f"[{self.uid}] 连接失败: {e}")
             self.connected = False
             self.websocket = None
+            await asyncio.sleep(3)
             return False
 
     def _is_ws_open(self) -> bool:
