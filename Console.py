@@ -268,7 +268,7 @@ def main():
             mode = input("模式 (0=扫描线, 1=随机, 默认1): ").strip() or "1"
             if mode=="1":
                 mode="2"
-            else
+            else:
                 mode="1"
         except Exception:
             offset_x = offset_y = 0
@@ -291,4 +291,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
