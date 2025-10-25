@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------
 # 修复：移除末尾空格（关键！）
 # ---------------------------
-API_BASE_URL = "https://paintboard.luogu.me"
+API_BASE_URL = "https://paintboard.luogu.me"  # ← 已修复：删除末尾空格
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
 USER_CREDENTIALS = [
@@ -112,7 +112,6 @@ class PaintBoardClient:
             elif self.connection_type == "writeonly":
                 url += "?writeonly=1"
 
-            # 使用 aiohttp 的 WebSocket
             ws = await session.ws_connect(url)
             self.websocket = ws
             self.connected = not ws.closed
@@ -126,7 +125,18 @@ class PaintBoardClient:
 
     def _is_ws_open(self) -> bool:
         ws = self.websocket
-        return ws is not None and not ws.closed
+        if ws is None or ws.closed:
+            return False
+        # 额外检查 transport 是否 still writable
+        try:
+            # aiohttp 的 WebSocketResponse 有 _writer.transport
+            transport = ws._writer.transport
+            if transport is None or transport.is_closing():
+                return False
+        except Exception:
+            # 如果无法检查 transport，保守认为不可用
+            return False
+        return True
 
     async def ensure_connected(self, session: aiohttp.ClientSession):
         if not self._is_ws_open():
@@ -137,8 +147,15 @@ class PaintBoardClient:
     async def _ws_send_bytes(self, data: bytes):
         ws = self.websocket
         if ws is None or ws.closed:
-            raise RuntimeError("WebSocket is not open")
-        await ws.send_bytes(data)
+            raise RuntimeError("WebSocket is closed")
+        try:
+            await ws.send_bytes(data)
+        except Exception as e:
+            # 捕获 transport closing 错误
+            if "closing transport" in str(e):
+                logger.warning(f"[{self.uid}] WebSocket transport 正在关闭，无法发送数据")
+                self.connected = False
+            raise
 
     async def send_heartbeat(self):
         while True:
