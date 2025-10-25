@@ -18,6 +18,31 @@ API_BASE_URL = "https://paintboard.luogu.me"
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
 USER_CREDENTIALS = [
+    (661094, "lDrv8W9u"), (661913, "lFT03zMS"), (1351126, "UJUVuzyk"),
+    (1032267, "6XF2wDhG"), (1404345, "dJvxSGv6"), (1036010, "hcB8wQzm"),
+    (703022, "gJNV9lrN"), (1406692, "0WMtD3G7"), (1058607, "iyuq7QA2"),
+    (1276209, "vzciwZs7"), (1227240, "WwnnjHVP"), (1406674, "NtqPbU8t"),
+    (661984, "3BRDNLh0"), (1038207, "s3Cp6arh"),
+    (1114894,"AKOWVHhq"),
+    (964876,"K5YD3T6D"),
+    (1227525,"KRXAngG0"),
+    (1353086,"8bkVmyr4"),
+    (1271532,"D9oYJsR4"),
+    (556851,"Sup3mJwj"),
+    (985515,"4TQ2uSNY"),
+    (556676,"TbkdS4RX"),
+    (911833,"QFc8hfZm"),
+    (1646931,"ZJ8uDehZ"),
+    (717599,"cHpWkkmz"),
+    (748239,"0hjUxOD0"),
+    (1261083,"uZxT0hps"),
+    (681755,"gdeHd93f"),
+    (1041338,"3rHIwBtw"),
+    (1747411,"MINOqrED"),
+    (1021053,"qE5hxvv9"),
+    (1890667,"Ew40x77v"),
+    (774851,"AenNc8Ln"),
+    (1035756,"Iyfsiylq")
 ]
 
 class AccountManager:
@@ -176,7 +201,7 @@ class FastPainter:
             pixel = await self.scheduler.get_next_pixel(board)
             if pixel is None:
                 if time.time() - last_log > 5:
-                    logger.info("✅ 绘制完成！所有像素已正确。")
+                    logger.info("绘制完成！所有像素已正确。")
                     last_log = time.time()
                 await asyncio.sleep(5)
                 continue
@@ -232,10 +257,10 @@ def main():
         offset_y = int(sys.argv[3]) if len(sys.argv) > 3 else 0
         mode = sys.argv[4] if len(sys.argv) > 4 else "1"
     else:
-        print("🎨 GenGen Painter (最快全量版)")
+        print("GenGen Painter (最快全量版)")
         image_path = input("请输入图像路径: ").strip()
         if not os.path.exists(image_path):
-            print("❌ 文件不存在")
+            print("文件不存在")
             sys.exit(1)
         try:
             offset_x = int(input("X 偏移 (默认0): ") or "0")
@@ -249,7 +274,7 @@ def main():
         mode = "1"
 
     mode_name = "扫描线" if mode == "1" else "随机撒点"
-    print(f"\n🚀 启动 {mode_name} 模式（全量差异检测，30秒/点）")
+    print(f"\n启动 {mode_name} 模式（全量差异检测，30秒/点）")
     print(f"账户数: {len(USER_CREDENTIALS)} | 偏移: ({offset_x}, {offset_y})")
     print("按 Ctrl+C 停止\n")
 
@@ -257,7 +282,7 @@ def main():
     try:
         asyncio.run(painter.run())
     except KeyboardInterrupt:
-        print("\n🛑 已停止")
+        print("\n已停止")
 
 
 if __name__ == "__main__":
