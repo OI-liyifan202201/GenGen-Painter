@@ -265,7 +265,11 @@ def main():
         try:
             offset_x = int(input("X 偏移 (默认0): ") or "0")
             offset_y = int(input("Y 偏移 (默认0): ") or "0")
-            mode = input("模式 (1=扫描线, 2=随机, 默认1): ").strip() or "1"
+            mode = input("模式 (0=扫描线, 1=随机, 默认1): ").strip() or "1"
+            if mode=="1":
+                mode="2"
+            else
+                mode="1"
         except Exception:
             offset_x = offset_y = 0
             mode = "1"
@@ -287,3 +291,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
