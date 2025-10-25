@@ -4,474 +4,261 @@ import random
 import time
 import heapq
 import logging
-import threading
 import numpy as np
-from collections import deque
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 from PIL import Image
 import sys
 import os
-import math
 import aiohttp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------------------
-# 修复：移除末尾空格（关键！）
-# ---------------------------
-API_BASE_URL = "https://paintboard.luogu.me" 
+API_BASE_URL = "https://paintboard.luogu.me"
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
 USER_CREDENTIALS = [
-    (661094, "lDrv8W9u"), (661913, "lFT03zMS"), (1351126, "UJUVuzyk"),
-    (1032267, "6XF2wDhG"), (1404345, "dJvxSGv6"), (1036010, "hcB8wQzm"),
-    (703022, "gJNV9lrN"), (1406692, "0WMtD3G7"), (1058607, "iyuq7QA2"),
-    (1276209, "vzciwZs7"), (1227240, "WwnnjHVP"), (1406674, "NtqPbU8t"),
-    (661984, "3BRDNLh0"), (1038207, "s3Cp6arh"),
-    # 其余受邀保密
 ]
 
-# ---------------------------
-# 优先队列版 AccountManager
-# ---------------------------
 class AccountManager:
     def __init__(self, credentials: List[Tuple[int, str]]):
-        self.lock = threading.Lock()
-        self.cooling_time = 30
         self.heap = []
         now = time.time()
-        for uid, access_key in credentials:
-            heapq.heappush(self.heap, (now, uid, access_key, None))
+        for uid, key in credentials:
+            heapq.heappush(self.heap, (now, uid, key))
 
-    def get_available_account(self) -> Optional[Dict]:
-        with self.lock:
-            if not self.heap:
-                return None
-            next_available, uid, access_key, token = self.heap[0]
-            now = time.time()
-            if now >= next_available:
-                heapq.heappop(self.heap)
-                return {"uid": uid, "access_key": access_key, "token": token}
+    def get_available_account(self) -> Optional[Tuple[int, str]]:
+        if not self.heap:
             return None
+        next_time, uid, key = self.heap[0]
+        if time.time() >= next_time:
+            heapq.heappop(self.heap)
+            return (uid, key)
+        return None
 
-    def release_account(self, uid: int, access_key: str, token: Optional[str]):
-        with self.lock:
-            next_available = time.time() + self.cooling_time
-            heapq.heappush(self.heap, (next_available, uid, access_key, token))
-
-    def update_token(self, uid: int, token: str):
-        with self.lock:
-            new_heap = []
-            for next_available, u, access_key, t in self.heap:
-                if u == uid:
-                    new_heap.append((next_available, u, access_key, token))
-                else:
-                    new_heap.append((next_available, u, access_key, t))
-            heapq.heapify(new_heap)
-            self.heap = new_heap
+    def release_account(self, uid: int, key: str):
+        next_time = time.time() + 30
+        heapq.heappush(self.heap, (next_time, uid, key))
 
 
-# ---------------------------
-# PaintBoardClient (使用 aiohttp WebSocket)
-# ---------------------------
-class PaintBoardClient:
-    def __init__(self, uid: int, access_key: str, connection_type="writeonly", account_manager=None):
+class SimpleClient:
+    def __init__(self, uid: int, access_key: str):
         self.uid = uid
         self.access_key = access_key
-        self.connection_type = connection_type
-        self.account_manager = account_manager
         self.token = None
-        self.websocket = None
-        self.connected = False
-        self.last_heartbeat = time.time()
+        self.ws = None
+        self.session = None
 
-    async def get_token(self, session: aiohttp.ClientSession):
+    async def get_token(self):
+        url = f"{API_BASE_URL}/api/auth/gettoken"
+        payload = {"uid": self.uid, "access_key": self.access_key}
         try:
-            url = f"{API_BASE_URL}/api/auth/gettoken"
-            payload = {"uid": self.uid, "access_key": self.access_key}
-            async with session.post(url, json=payload) as resp:
-                result = await resp.json()
-                if "data" in result:
-                    self.token = result["data"]["token"]
-                    if self.account_manager:
-                        self.account_manager.update_token(self.uid, self.token)
+            async with self.session.post(url, json=payload) as resp:
+                data = await resp.json()
+                if data.get("status") == 200 and "data" in data:
+                    self.token = data["data"]["token"]
                     return True
-                return False
         except Exception as e:
-            logger.error(f"获取 token 失败: {e}")
-            return False
+            logger.error(f"[{self.uid}] 获取 token 失败: {e}")
+        return False
 
-    async def connect_websocket(self, session: aiohttp.ClientSession):
+    async def connect_ws(self):
         if not self.token:
-            if not await self.get_token(session):
+            if not await self.get_token():
                 return False
         try:
-            url = WEBSOCKET_URL
-            if self.connection_type == "readonly":
-                url += "?readonly=1"
-            elif self.connection_type == "writeonly":
-                url += "?writeonly=1"
-
-            ws = await session.ws_connect(url)
-            self.websocket = ws
-            self.connected = not ws.closed
-            # logger.info(f"[{self.uid}] WebSocket 连接结果: connected={self.connected}, ws_type={type(ws).__name__}")
-            return self.connected
+            url = f"{WEBSOCKET_URL}?writeonly=1"
+            self.ws = await self.session.ws_connect(url)
+            return True
         except Exception as e:
-            # logger.error(f"[{self.uid}] 连接失败: {e}")
-            self.connected = False
-            self.websocket = None
-            await asyncio.sleep(3)
+            logger.error(f"[{self.uid}] WebSocket 连接失败: {e}")
             return False
 
-    def _is_ws_open(self) -> bool:
-        ws = self.websocket
-        if ws is None or ws.closed:
-            return False
-        # 额外检查 transport 是否 still writable
-        try:
-            # aiohttp 的 WebSocketResponse 有 _writer.transport
-            transport = ws._writer.transport
-            if transport is None or transport.is_closing():
+    async def ensure_ready(self, session: aiohttp.ClientSession):
+        self.session = session
+        if self.ws is None or self.ws.closed:
+            if not await self.connect_ws():
                 return False
-        except Exception:
-            # 如果无法检查 transport，保守认为不可用
-            return False
         return True
 
-    async def ensure_connected(self, session: aiohttp.ClientSession):
-        if not self._is_ws_open():
-            logger.info(f"[{self.uid}] 重新连接 WebSocket...")
-            return await self.connect_websocket(session)
-        return True
-
-    async def _ws_send_bytes(self, data: bytes):
-        ws = self.websocket
-        if ws is None or ws.closed:
-            raise RuntimeError("WebSocket is closed")
-        try:
-            await ws.send_bytes(data)
-        except Exception as e:
-            # 捕获 transport closing 错误
-            if "closing transport" in str(e):
-                logger.warning(f"[{self.uid}] WebSocket transport 正在关闭，无法发送数据")
-                self.connected = False
-            raise
-
-    async def send_heartbeat(self):
-        while True:
-            try:
-                if self._is_ws_open():
-                    try:
-                        await self._ws_send_bytes(bytes([0xfb]))
-                        self.last_heartbeat = time.time()
-                    except Exception as e:
-                        logger.error(f"[{self.uid}] 心跳发送失败: {e}")
-                        self.connected = False
-                else:
-                    self.connected = False
-            except Exception as e:
-                logger.error(f"心跳失败: {e}")
-                self.connected = False
-            await asyncio.sleep(10)
-
-    async def send_paint_data(self, x, y, r, g, b):
-        if not self._is_ws_open():
-            logger.debug(f"[{self.uid}] WebSocket 未连接或已关闭，跳过绘制 ({x},{y})")
-            self.connected = False
-            return False
-        if self.token is None:
-            logger.warning(f"[{self.uid}] 无有效 token，无法绘制")
+    async def send_pixel(self, x: int, y: int, r: int, g: int, b: int) -> bool:
+        if not self.token:
             return False
         try:
-            packet = bytearray()
-            packet.append(0xfe)
+            packet = bytearray([0xfe])
             packet.extend(struct.pack('<H', x))
             packet.extend(struct.pack('<H', y))
             packet.extend([r, g, b])
             packet.extend(struct.pack('<I', self.uid)[:3])
             token_clean = self.token.replace('-', '')
             if len(token_clean) != 32:
-                logger.error(f"[{self.uid}] Token 长度异常: {len(token_clean)}")
                 return False
             token_bytes = bytes.fromhex(token_clean)
             packet.extend(token_bytes)
-            packet.extend(struct.pack('<I', random.randint(0, 2**32-1)))
-            await self._ws_send_bytes(bytes(packet))
-            logger.debug(f"[{self.uid}] 成功绘制 ({x},{y}) -> RGB({r},{g},{b})")
+            packet.extend(struct.pack('<I', random.randint(0, 2**32 - 1)))
+            await self.ws.send_bytes(bytes(packet))
             return True
         except Exception as e:
-            logger.warning(f"[{self.uid}] 绘制失败 ({x},{y}): {e}")
-            self.connected = False
+            logger.warning(f"[{self.uid}] 发送失败 ({x},{y}): {e}")
+            self.ws = None
             return False
 
 
-# ---------------------------
-# WorkScheduler (支持 scanline / random)
-# ---------------------------
-class WorkScheduler:
-    def __init__(self, image_data, board, offset_x=0, offset_y=0, mode="scanline"):
-        self.image_data = image_data
-        self.height, self.width, _ = image_data.shape
-        self.offset_x = offset_x
-        self.offset_y = offset_y
-        self.mode = mode
-        pixels = []
-        for y in range(self.height):
-            for x in range(self.width):
-                bx, by = x + offset_x, y + offset_y
+class FullWorkScheduler:
+    def __init__(self, target_image: np.ndarray, offset_x: int, offset_y: int, mode: str):
+        self.target = target_image
+        self.h, self.w = target_image.shape[:2]
+        self.ox, self.oy = offset_x, offset_y
+        self.mode = mode  # 'scanline' or 'random'
+
+    async def get_next_pixel(self, current_board: np.ndarray) -> Optional[Tuple[int, int, int, int, int]]:
+        diff_pixels = []
+        for y in range(self.h):
+            for x in range(self.w):
+                bx, by = x + self.ox, y + self.oy
                 if bx >= 1000 or by >= 600:
                     continue
-                if not np.array_equal(image_data[y, x], board[by, bx]):
-                    pixels.append((x, y))
-        if mode == "random":
-            random.shuffle(pixels)
-        self.work_queue = deque(pixels)
-        self.total = len(self.work_queue)
-        self.done = 0
+                expected = self.target[y, x]
+                actual = current_board[by, bx]
+                if not np.array_equal(expected, actual):
+                    r, g, b = expected
+                    diff_pixels.append((bx, by, int(r), int(g), int(b)))
 
-    def get_next_batch(self, batch_size=3):
-        batch = []
-        for _ in range(batch_size):
-            if not self.work_queue:
-                break
-            x, y = self.work_queue.popleft()
-            r, g, b = self.image_data[y, x]
-            batch.append((x + self.offset_x, y + self.offset_y, r, g, b))
-            self.done += 1
-        return batch
+        if not diff_pixels:
+            return None
 
-    def dynamic_sample_rate(self):
-        progress = self.done / self.total if self.total else 1
-        if progress < 0.3:
-            return 0.05
-        elif progress < 0.7:
-            return 0.1
+        if self.mode == "scanline":
+            # 返回第一个（顺序）
+            return diff_pixels[0]
         else:
-            return 0.3
+            # 随机
+            return random.choice(diff_pixels)
+
+    def total_pixels(self) -> int:
+        return self.h * self.w
 
 
-# ---------------------------
-# ImagePainter (批量调度)
-# ---------------------------
-class ImagePainter:
-    def __init__(self, image_path, offset_x=0, offset_y=0, mode="scanline"):
+class FastPainter:
+    def __init__(self, image_path: str, offset_x: int, offset_y: int, mode: str):
         self.image_path = image_path
         self.offset_x = offset_x
         self.offset_y = offset_y
-        self.mode = mode
+        self.mode = "scanline" if mode == "1" else "random"
         self.account_manager = AccountManager(USER_CREDENTIALS)
-        self.clients = [PaintBoardClient(uid, key, "writeonly", self.account_manager)
-                        for uid, key in USER_CREDENTIALS[:-1]]
-        self.read_client = PaintBoardClient(USER_CREDENTIALS[-1][0], USER_CREDENTIALS[-1][1], "readonly")
+        self.clients = {uid: SimpleClient(uid, key) for uid, key in USER_CREDENTIALS}
+        self.target_image = None
         self.scheduler = None
         self.running = True
 
     def load_image(self):
         img = Image.open(self.image_path).convert("RGB")
-        self.image_data = np.array(img)
-        return True
+        self.target_image = np.array(img)
+        self.scheduler = FullWorkScheduler(self.target_image, self.offset_x, self.offset_y, self.mode)
 
-    async def get_board_state(self, session: aiohttp.ClientSession):
+    async def get_board(self, session: aiohttp.ClientSession) -> Optional[np.ndarray]:
         try:
             async with session.get(f"{API_BASE_URL}/api/paintboard/getboard") as resp:
-                content = await resp.read()
-                board = np.frombuffer(content, dtype=np.uint8).reshape((600, 1000, 3))
-                return board
+                data = await resp.read()
+                return np.frombuffer(data, dtype=np.uint8).reshape((600, 1000, 3))
         except Exception as e:
-            logger.error(f"获取画板状态失败: {e}")
+            logger.error(f"获取画板失败: {e}")
             return None
 
-    async def send_task(self, session: aiohttp.ClientSession):
-        last_log_time = 0
+    async def paint_loop(self, session: aiohttp.ClientSession):
+        last_log = 0
+        total = self.scheduler.total_pixels()
         while self.running:
-            if self.scheduler is None:
-                await asyncio.sleep(1)
-                continue
-            try:
-                account = self.account_manager.get_available_account()
-                if not account:
-                    await asyncio.sleep(0.2)
-                    continue
-
-                client = next((c for c in self.clients if c.uid == account['uid']), None)
-                if not client or not await client.ensure_connected(session):
-                    self.account_manager.release_account(account['uid'], account['access_key'], account.get('token'))
-                    await asyncio.sleep(0.5)
-                    continue
-
-                batch = self.scheduler.get_next_batch(batch_size=1)
-                if not batch:
-                    self.account_manager.release_account(account['uid'], account['access_key'], account.get('token'))
-                    if time.time() - last_log_time > 5:
-                        progress = self.scheduler.done / self.scheduler.total if self.scheduler.total else 1
-                        pct = progress * 100
-                        active_accounts = sum(1 for c in self.clients if c.connected)
-                        logger.info(
-                            f"初始进度: {self.scheduler.done}/{self.scheduler.total} ({pct:.1f}%) "
-                            f"- 修复任务: {len(self.scheduler.work_queue)} "
-                            f"- 活动账户: {active_accounts}/{len(self.clients)}"
-                        )
-                        last_log_time = time.time()
-                    await asyncio.sleep(0.5)
-                    continue
-
-                success_count = 0
-                for (x, y, r, g, b) in batch:
-                    if await client.send_paint_data(x, y, r, g, b):
-                        success_count += 1
-
-                self.account_manager.release_account(account['uid'], account['access_key'], account.get('token'))
-
-                if time.time() - last_log_time > 5:
-                    progress = self.scheduler.done / self.scheduler.total if self.scheduler.total else 1
-                    pct = progress * 100
-                    active_accounts = sum(1 for c in self.clients if c.connected)
-                    logger.info(
-                        f"初始进度: {self.scheduler.done}/{self.scheduler.total} ({pct:.1f}%) "
-                        f"- 修复任务: {len(self.scheduler.work_queue)} "
-                        f"- 活动账户: {active_accounts}/{len(self.clients)}"
-                    )
-                    last_log_time = time.time()
-
-                await asyncio.sleep(random.uniform(0.1, 0.5))
-
-            except Exception as e:
-                logger.error(f"发送任务异常: {e}")
-                await asyncio.sleep(1)
-
-    async def check_and_repair(self, session: aiohttp.ClientSession):
-        """动态采样修复检查"""
-        while self.running:
-            if self.scheduler is None:
-                await asyncio.sleep(1)
-                continue
-            try:
-                board = await self.get_board_state(session)
-                if board is None:
-                    await asyncio.sleep(5)
-                    continue
-
-                sample_rate = self.scheduler.dynamic_sample_rate()
-                total_pixels = self.scheduler.total
-                if total_pixels == 0:
-                    await asyncio.sleep(5)
-                    continue
-                sample_size = int(total_pixels * sample_rate)
-                sample_indices = random.sample(range(total_pixels), min(sample_size, 1000))
-
-                repair_count = 0
-                for idx in sample_indices:
-                    y = idx // self.scheduler.width
-                    x = idx % self.scheduler.width
-                    bx, by = x + self.offset_x, y + self.offset_y
-                    if bx >= 1000 or by >= 600:
-                        continue
-                    expected = self.scheduler.image_data[y, x]
-                    actual = board[by, bx]
-                    if not np.array_equal(expected, actual):
-                        self.scheduler.work_queue.append((x, y))
-                        repair_count += 1
-
-                if repair_count > 0:
-                    logger.info(f"修复检测发现 {repair_count} 个像素需要恢复")
-
+            board = await self.get_board(session)
+            if board is None:
                 await asyncio.sleep(5)
+                continue
 
-            except Exception as e:
-                logger.error(f"修复检测异常: {e}")
+            pixel = await self.scheduler.get_next_pixel(board)
+            if pixel is None:
+                if time.time() - last_log > 5:
+                    logger.info("✅ 绘制完成！所有像素已正确。")
+                    last_log = time.time()
                 await asyncio.sleep(5)
+                continue
+
+            x, y, r, g, b = pixel
+
+            account = self.account_manager.get_available_account()
+            if not account:
+                await asyncio.sleep(0.1)
+                continue
+
+            uid, key = account
+            client = self.clients[uid]
+
+            if not await client.ensure_ready(session):
+                self.account_manager.release_account(uid, key)
+                await asyncio.sleep(0.5)
+                continue
+
+            success = await client.send_pixel(x, y, r, g, b)
+            self.account_manager.release_account(uid, key)
+
+            if time.time() - last_log > 5:
+                # 重新获取差异数用于日志（轻量估算）
+                temp_diff = 0
+                for dy in range(self.scheduler.h):
+                    for dx in range(self.scheduler.w):
+                        bx, by = dx + self.offset_x, dy + self.offset_y
+                        if bx < 1000 and by < 600:
+                            if not np.array_equal(self.target_image[dy, dx], board[by, bx]):
+                                temp_diff += 1
+                done = total - temp_diff
+                pct = done / total * 100 if total else 100
+                logger.info(f"进度: {done}/{total} ({pct:.1f}%) - 差异像素: {temp_diff}")
+                last_log = time.time()
+
+            await asyncio.sleep(0.1)
 
     async def run(self):
-        """运行主流程"""
-        if not self.load_image():
-            return False
-
+        self.load_image()
         async with aiohttp.ClientSession() as session:
-            board = await self.get_board_state(session)
-            if board is None:
-                logger.error("无法获取画板状态")
-                return False
-
-            self.scheduler = WorkScheduler(self.image_data, board, self.offset_x, self.offset_y, self.mode)
-
-            # 启动任务
-            tasks = []
-            for client in self.clients:
-                tasks.append(asyncio.create_task(client.send_heartbeat()))
-            tasks.append(asyncio.create_task(self.send_task(session)))
-            tasks.append(asyncio.create_task(self.check_and_repair(session)))
-
             try:
-                await asyncio.gather(*tasks)
-            except asyncio.CancelledError:
-                pass
-            finally:
+                await self.paint_loop(session)
+            except KeyboardInterrupt:
                 self.running = False
-                for t in tasks:
-                    t.cancel()
-        return True
+                logger.info("程序已停止")
 
 
-def print_banner():
-    print("=" * 60)
-    print("                    GenGen Painter (冷却优化版)")
-    print("=" * 60)
-    print("新限制优化:")
-    print("  • 每个账户每30秒只能绘制1个点")
-    print("  • 动态适应账户数量 (当前可用账户: {}个)".format(len(USER_CREDENTIALS)))
-    print("  • 扫描线模式: 高效顺序绘制")
-    print("  • 随机撒点模式: 快速覆盖")
-    print("  • 智能修复: 自动检测并修复被覆盖像素")
-    print("=" * 60)
-
-
-def get_user_input():
-    print_banner()
-    image_path = r"c:\Users\admin\Desktop\result.jpeg"
-    if not os.path.exists(image_path):
-        print("默认路径文件不存在，请确保路径正确！")
-        sys.exit(1)
-
-    try:
-        offset_x = int(input("请输入左上角X坐标偏移 (默认0): ") or "0")
-        offset_y = int(input("请输入左上角Y坐标偏移 (默认0): ") or "0")
-
-        print("\n请选择工作模式:")
-        print("1. 扫描线模式 (高效顺序绘制，推荐)")
-        print("2. 随机撒点模式 (快速覆盖)")
-        mode_choice = input("请输入选择 (1 或 2, 默认1): ").strip()
-
-        mode = "random" if mode_choice == "2" else "scanline"
-        print(f"已选择: {'随机撒点模式' if mode == 'random' else '扫描线模式'}")
-
-    except ValueError:
-        offset_x, offset_y = 0, 0
-        mode = "scanline"
-
-    return image_path, offset_x, offset_y, mode
-
-
-async def main():
-    image_path, offset_x, offset_y, mode = get_user_input()
-    painter = ImagePainter(image_path, offset_x, offset_y, mode)
-    print("\n开始绘制...")
-    print(f"程序将使用 {len(USER_CREDENTIALS)-1} 个账户轮流绘制 (每账户30秒1点)")
-    print("按 Ctrl+C 停止程序\n")
-    try:
-        await painter.run()
-    except KeyboardInterrupt:
-        print("\n程序已停止")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
+def main():
+    if len(sys.argv) >= 2:
         image_path = sys.argv[1]
         offset_x = int(sys.argv[2]) if len(sys.argv) > 2 else 0
         offset_y = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-        mode = "random" if (len(sys.argv) > 4 and sys.argv[4] == "2") else "scanline"
-        painter = ImagePainter(image_path, offset_x, offset_y, mode)
-        asyncio.run(painter.run())
+        mode = sys.argv[4] if len(sys.argv) > 4 else "1"
     else:
-        asyncio.run(main())
+        print("🎨 GenGen Painter (最快全量版)")
+        image_path = input("请输入图像路径: ").strip()
+        if not os.path.exists(image_path):
+            print("❌ 文件不存在")
+            sys.exit(1)
+        try:
+            offset_x = int(input("X 偏移 (默认0): ") or "0")
+            offset_y = int(input("Y 偏移 (默认0): ") or "0")
+            mode = input("模式 (1=扫描线, 2=随机, 默认1): ").strip() or "1"
+        except Exception:
+            offset_x = offset_y = 0
+            mode = "1"
+
+    if mode not in ("1", "2"):
+        mode = "1"
+
+    mode_name = "扫描线" if mode == "1" else "随机撒点"
+    print(f"\n🚀 启动 {mode_name} 模式（全量差异检测，30秒/点）")
+    print(f"账户数: {len(USER_CREDENTIALS)} | 偏移: ({offset_x}, {offset_y})")
+    print("按 Ctrl+C 停止\n")
+
+    painter = FastPainter(image_path, offset_x, offset_y, mode)
+    try:
+        asyncio.run(painter.run())
+    except KeyboardInterrupt:
+        print("\n🛑 已停止")
+
+
+if __name__ == "__main__":
+    main()
