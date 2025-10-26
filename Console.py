@@ -14,9 +14,15 @@ import aiohttp
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# ---------------------------
+# 配置（无多余空格）
+# ---------------------------
 API_BASE_URL = "https://paintboard.luogu.me"
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
+# ---------------------------
+# 账号列表（34个）
+# ---------------------------
 USER_CREDENTIALS = [
     (661094, "lDrv8W9u"), (661913, "lFT03zMS"), (1351126, "UJUVuzyk"),
     (1032267, "6XF2wDhG"), (1404345, "dJvxSGv6"), (1036010, "hcB8wQzm"),
@@ -45,6 +51,9 @@ USER_CREDENTIALS = [
     (1035756,"Iyfsiylq")
 ]
 
+# ---------------------------
+# 账户冷却管理器
+# ---------------------------
 class AccountManager:
     def __init__(self, credentials: List[Tuple[int, str]]):
         self.heap = []
@@ -62,10 +71,13 @@ class AccountManager:
         return None
 
     def release_account(self, uid: int, key: str):
-        next_time = time.time() + 30
+        next_time = time.time() + 30  # 30秒冷却
         heapq.heappush(self.heap, (next_time, uid, key))
 
 
+# ---------------------------
+# 简化客户端（自动重连 + transport 错误处理）
+# ---------------------------
 class SimpleClient:
     def __init__(self, uid: int, access_key: str):
         self.uid = uid
@@ -75,22 +87,23 @@ class SimpleClient:
         self.session = None
 
     async def get_token(self):
-        url = f"{API_BASE_URL}/api/auth/gettoken"
-        payload = {"uid": self.uid, "access_key": self.access_key}
+        if self.token:
+            return True
         try:
+            url = f"{API_BASE_URL}/api/auth/gettoken"
+            payload = {"uid": self.uid, "access_key": self.access_key}
             async with self.session.post(url, json=payload) as resp:
                 data = await resp.json()
-                if data.get("status") == 200 and "data" in data:
+                if data.get("statusCode") == 200 and "data" in data:
                     self.token = data["data"]["token"]
                     return True
+                else:
+                    logger.error(f"[{self.uid}] 获取 token 失败: {data}")
         except Exception as e:
-            logger.error(f"[{self.uid}] 获取 token 失败: {e}")
+            logger.error(f"[{self.uid}] 获取 token 异常: {e}")
         return False
 
     async def connect_ws(self):
-        if not self.token:
-            if not await self.get_token():
-                return False
         try:
             url = f"{WEBSOCKET_URL}?writeonly=1"
             self.ws = await self.session.ws_connect(url)
@@ -102,12 +115,15 @@ class SimpleClient:
     async def ensure_ready(self, session: aiohttp.ClientSession):
         self.session = session
         if self.ws is None or self.ws.closed:
+            self.ws = None
+            if not await self.get_token():
+                return False
             if not await self.connect_ws():
                 return False
         return True
 
     async def send_pixel(self, x: int, y: int, r: int, g: int, b: int) -> bool:
-        if not self.token:
+        if self.ws is None or self.ws.closed:
             return False
         try:
             packet = bytearray([0xfe])
@@ -117,27 +133,41 @@ class SimpleClient:
             packet.extend(struct.pack('<I', self.uid)[:3])
             token_clean = self.token.replace('-', '')
             if len(token_clean) != 32:
+                logger.error(f"[{self.uid}] Token 长度错误: {len(token_clean)}")
                 return False
             token_bytes = bytes.fromhex(token_clean)
             packet.extend(token_bytes)
             packet.extend(struct.pack('<I', random.randint(0, 2**32 - 1)))
             await self.ws.send_bytes(bytes(packet))
             return True
+        except (RuntimeError, ConnectionError, OSError) as e:
+            err_str = str(e)
+            if "closing transport" in err_str or "Cannot write" in err_str or "broken pipe" in err_str.lower():
+                logger.warning(f"[{self.uid}] WebSocket 连接已失效（closing transport），将重连")
+            else:
+                logger.warning(f"[{self.uid}] 连接异常: {e}")
+            self.ws = None
+            # 不清空 token，因为 token 通常仍有效；仅连接失效
+            return False
         except Exception as e:
-            logger.warning(f"[{self.uid}] 发送失败 ({x},{y}): {e}")
+            logger.warning(f"[{self.uid}] 发送未知错误: {e}")
             self.ws = None
             return False
 
 
-class FullWorkScheduler:
+# ---------------------------
+# 全量差异调度器（支持扫描线/随机）
+# ---------------------------
+class FullDiffScheduler:
     def __init__(self, target_image: np.ndarray, offset_x: int, offset_y: int, mode: str):
         self.target = target_image
         self.h, self.w = target_image.shape[:2]
         self.ox, self.oy = offset_x, offset_y
-        self.mode = mode  # 'scanline' or 'random'
+        self.mode = mode  # "scanline" or "random"
+        self.total_pixels = self.h * self.w
 
-    async def get_next_pixel(self, current_board: np.ndarray) -> Optional[Tuple[int, int, int, int, int]]:
-        diff_pixels = []
+    async def get_work_list(self, current_board: np.ndarray) -> List[Tuple[int, int, int, int, int]]:
+        diffs = []
         for y in range(self.h):
             for x in range(self.w):
                 bx, by = x + self.ox, y + self.oy
@@ -147,22 +177,17 @@ class FullWorkScheduler:
                 actual = current_board[by, bx]
                 if not np.array_equal(expected, actual):
                     r, g, b = expected
-                    diff_pixels.append((bx, by, int(r), int(g), int(b)))
-
-        if not diff_pixels:
-            return None
-
+                    diffs.append((bx, by, int(r), int(g), int(b)))
         if self.mode == "scanline":
-            # 返回第一个（顺序）
-            return diff_pixels[0]
-        else:
-            # 随机
-            return random.choice(diff_pixels)
-
-    def total_pixels(self) -> int:
-        return self.h * self.w
+            diffs.sort(key=lambda p: (p[1], p[0]))  # 按 y, x 排序
+        elif self.mode == "random":
+            random.shuffle(diffs)
+        return diffs
 
 
+# ---------------------------
+# 主绘制器
+# ---------------------------
 class FastPainter:
     def __init__(self, image_path: str, offset_x: int, offset_y: int, mode: str):
         self.image_path = image_path
@@ -178,7 +203,7 @@ class FastPainter:
     def load_image(self):
         img = Image.open(self.image_path).convert("RGB")
         self.target_image = np.array(img)
-        self.scheduler = FullWorkScheduler(self.target_image, self.offset_x, self.offset_y, self.mode)
+        self.scheduler = FullDiffScheduler(self.target_image, self.offset_x, self.offset_y, self.mode)
 
     async def get_board(self, session: aiohttp.ClientSession) -> Optional[np.ndarray]:
         try:
@@ -189,107 +214,95 @@ class FastPainter:
             logger.error(f"获取画板失败: {e}")
             return None
 
-    async def paint_loop(self, session: aiohttp.ClientSession):
-        last_log = 0
-        total = self.scheduler.total_pixels()
-        while self.running:
-            board = await self.get_board(session)
-            if board is None:
-                await asyncio.sleep(5)
-                continue
-
-            pixel = await self.scheduler.get_next_pixel(board)
-            if pixel is None:
-                if time.time() - last_log > 5:
-                    logger.info("绘制完成！所有像素已正确。")
-                    last_log = time.time()
-                await asyncio.sleep(5)
-                continue
-
-            x, y, r, g, b = pixel
-
-            account = self.account_manager.get_available_account()
-            if not account:
-                await asyncio.sleep(0.1)
-                continue
-
-            uid, key = account
-            client = self.clients[uid]
-
-            if not await client.ensure_ready(session):
-                self.account_manager.release_account(uid, key)
-                await asyncio.sleep(0.5)
-                continue
-
-            success = await client.send_pixel(x, y, r, g, b)
-            self.account_manager.release_account(uid, key)
-
-            if time.time() - last_log > 5:
-                # 重新获取差异数用于日志（轻量估算）
-                temp_diff = 0
-                for dy in range(self.scheduler.h):
-                    for dx in range(self.scheduler.w):
-                        bx, by = dx + self.offset_x, dy + self.offset_y
-                        if bx < 1000 and by < 600:
-                            if not np.array_equal(self.target_image[dy, dx], board[by, bx]):
-                                temp_diff += 1
-                done = total - temp_diff
-                pct = done / total * 100 if total else 100
-                logger.info(f"进度: {done}/{total} ({pct:.1f}%) - 差异像素: {temp_diff}")
-                last_log = time.time()
-
-            await asyncio.sleep(0.1)
-
     async def run(self):
         self.load_image()
         async with aiohttp.ClientSession() as session:
-            try:
-                await self.paint_loop(session)
-            except KeyboardInterrupt:
-                self.running = False
-                logger.info("程序已停止")
+            last_log = 0
+            while self.running:
+                board = await self.get_board(session)
+                if board is None:
+                    await asyncio.sleep(5)
+                    continue
+
+                work_list = await self.scheduler.get_work_list(board)
+                done = self.scheduler.total_pixels - len(work_list)
+                total = self.scheduler.total_pixels
+                progress_pct = (done / total * 100) if total > 0 else 100.0
+
+                if not work_list:
+                    if time.time() - last_log > 5:
+                        active = sum(1 for c in self.clients.values() if c.ws and not c.ws.closed)
+                        logger.info(f"初始进度: {done}/{total} ({progress_pct:.1f}%) - 修复任务: 0 - 活动账户: {active}/{len(USER_CREDENTIALS)}")
+                        logger.info("绘制已完成！持续监控中...")
+                        last_log = time.time()
+                    await asyncio.sleep(5)
+                    continue
+
+                # 取第一个任务
+                x, y, r, g, b = work_list[0]
+
+                account = self.account_manager.get_available_account()
+                if not account:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                uid, key = account
+                client = self.clients[uid]
+
+                if not await client.ensure_ready(session):
+                    self.account_manager.release_account(uid, key)
+                    await asyncio.sleep(0.5)
+                    continue
+
+                success = await client.send_pixel(x, y, r, g, b)
+                self.account_manager.release_account(uid, key)
+
+                # 日志输出（每5秒）
+                if time.time() - last_log > 5:
+                    active = sum(1 for c in self.clients.values() if c.ws and not c.ws.closed)
+                    logger.info(f"初始进度: {done}/{total} ({progress_pct:.1f}%) - 修复任务: {len(work_list)} - 活动账户: {active}/{len(USER_CREDENTIALS)}")
+                    last_log = time.time()
+
+                await asyncio.sleep(0.1)
 
 
+# ---------------------------
+# 启动入口
+# ---------------------------
 def main():
-    if len(sys.argv) >= 2:
-        image_path = sys.argv[1]
-        offset_x = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-        offset_y = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    if len(sys.argv) < 4:
+        print("用法: python painter.py <图片路径> <X偏移> <Y偏移> [模式]")
+        sys.exit(1)
+
+    image_path = sys.argv[1]
+    if not os.path.exists(image_path):
+        print(f"图像文件不存在: {image_path}")
+        sys.exit(1)
+
+    try:
+        offset_x = int(sys.argv[2])
+        offset_y = int(sys.argv[3])
         mode = sys.argv[4] if len(sys.argv) > 4 else "1"
-    else:
-        print("GenGen Painter (最快全量版)")
-        image_path = input("请输入图像路径: ").strip()
-        if not os.path.exists(image_path):
-            print("文件不存在")
+        if mode not in ("0", "1"):
+            print("模式必须是 0 或 1")
             sys.exit(1)
-        try:
-            offset_x = int(input("X 偏移 (默认0): ") or "0")
-            offset_y = int(input("Y 偏移 (默认0): ") or "0")
-            mode = input("模式 (0=扫描线, 1=随机, 默认1): ").strip() or "1"
-            if mode=="1":
-                mode="2"
-            else:
-                mode="1"
-        except Exception:
-            offset_x = offset_y = 0
-            mode = "1"
+    except ValueError as e:
+        print(f"参数错误: {e}")
+        sys.exit(1)
 
-    if mode not in ("1", "2"):
-        mode = "1"
-
-    mode_name = "扫描线" if mode == "1" else "随机撒点"
-    print(f"\n启动 {mode_name} 模式（全量差异检测，30秒/点）")
-    print(f"账户数: {len(USER_CREDENTIALS)} | 偏移: ({offset_x}, {offset_y})")
+    print(f"\n启动绘制任务")
+    print(f"图片: {image_path}")
+    print(f"偏移: ({offset_x}, {offset_y})")
+    print(f"模式: {'扫描线' if mode == '1' else '随机撒点'}")
+    print(f"账号数: {len(USER_CREDENTIALS)}")
     print("按 Ctrl+C 停止\n")
 
     painter = FastPainter(image_path, offset_x, offset_y, mode)
     try:
         asyncio.run(painter.run())
     except KeyboardInterrupt:
-        print("\n已停止")
+        print("\n用户中断，程序退出")
 
 
 if __name__ == "__main__":
     main()
-
-
