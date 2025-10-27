@@ -17,9 +17,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ---------------------------
-# ĞŞ¸´£ºÒÆ³ıÄ©Î²¿Õ¸ñ£¨¹Ø¼ü£¡£©
+# ä¿®å¤ï¼šç§»é™¤æœ«å°¾ç©ºæ ¼ï¼ˆå…³é”®ï¼ï¼‰
 # ---------------------------
-API_BASE_URL = "https://paintboard.luogu.me"
+API_BASE_URL = "https://paintboard.luogu.me"  # â† å·²åˆ é™¤æœ«å°¾ç©ºæ ¼ï¼
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
 USER_CREDENTIALS = [
@@ -50,10 +50,10 @@ USER_CREDENTIALS = [
     (1035756,"Iyfsiylq")
 ]
 
-COOLING_TIME = 30  # ÀäÈ´Ê±¼ä£¨Ãë£©
+COOLING_TIME = 30  # å†·å´æ—¶é—´ï¼ˆç§’ï¼‰
 
 # ---------------------------
-# ÓÅ»¯°æ AccountManager£º¾«È·ÀäÈ´ + Token »º´æ
+# ä¼˜åŒ–ç‰ˆ AccountManagerï¼šç²¾ç¡®å†·å´ + Token ç¼“å­˜
 # ---------------------------
 class AccountManager:
     def __init__(self, credentials: List[Tuple[int, str]]):
@@ -92,7 +92,7 @@ class AccountManager:
 
 
 # ---------------------------
-# PaintBoardClient£ºToken ¸´ÓÃ + ×Ô¶¯ÖØÁ¬
+# PaintBoardClientï¼šä½¿ç”¨å¤–éƒ¨ sessionï¼Œç¦æ­¢å†…éƒ¨åˆ›å»º
 # ---------------------------
 class PaintBoardClient:
     def __init__(self, uid: int, access_key: str, connection_type="writeonly", account_manager=None):
@@ -105,6 +105,10 @@ class PaintBoardClient:
         self.connected = False
         self.last_heartbeat = time.time()
 
+    def _is_ws_open(self) -> bool:
+        ws = self.websocket
+        return ws is not None and not ws.closed
+
     async def get_token(self, session: aiohttp.ClientSession):
         try:
             url = f"{API_BASE_URL}/api/auth/gettoken"
@@ -115,13 +119,13 @@ class PaintBoardClient:
                     self.token = result["data"]["token"]
                     if self.account_manager:
                         self.account_manager.update_token(self.uid, self.token)
-                    logger.info(f"[{self.uid}] »ñÈ¡ĞÂ Token ³É¹¦")
+                    logger.info(f"[{self.uid}] è·å–æ–° Token æˆåŠŸ")
                     return True
                 else:
-                    logger.error(f"[{self.uid}] »ñÈ¡ Token Ê§°Ü: {result}")
+                    logger.error(f"[{self.uid}] è·å– Token å¤±è´¥: {result}")
                     return False
         except Exception as e:
-            logger.error(f"[{self.uid}] »ñÈ¡ Token Òì³£: {e}")
+            logger.error(f"[{self.uid}] è·å– Token å¼‚å¸¸: {e}")
             return False
 
     async def connect_websocket(self, session: aiohttp.ClientSession):
@@ -138,21 +142,17 @@ class PaintBoardClient:
             ws = await session.ws_connect(url, timeout=10, autoclose=True)
             self.websocket = ws
             self.connected = True
-            logger.info(f"[{self.uid}] WebSocket Á¬½Ó³É¹¦")
+            logger.info(f"[{self.uid}] WebSocket è¿æ¥æˆåŠŸ")
             return True
         except Exception as e:
-            logger.error(f"[{self.uid}] WebSocket Á¬½ÓÊ§°Ü: {e}")
+            logger.error(f"[{self.uid}] WebSocket è¿æ¥å¤±è´¥: {e}")
             self.connected = False
             self.websocket = None
             return False
 
-    def _is_ws_open(self) -> bool:
-        ws = self.websocket
-        return ws is not None and not ws.closed
-
     async def ensure_connected(self, session: aiohttp.ClientSession):
         if not self._is_ws_open():
-            logger.info(f"[{self.uid}] WebSocket ¶Ï¿ª£¬³¢ÊÔÖØÁ¬...")
+            logger.info(f"[{self.uid}] WebSocket æ–­å¼€ï¼Œå°è¯•é‡è¿...")
             return await self.connect_websocket(session)
         return True
 
@@ -161,25 +161,26 @@ class PaintBoardClient:
             raise RuntimeError("WebSocket closed")
         await self.websocket.send_bytes(data)
 
-    async def send_heartbeat(self):
+    async def send_heartbeat(self, session: aiohttp.ClientSession):
+        """åªå‘é€å¿ƒè·³ï¼Œä¸å¤„ç†é‡è¿"""
         while True:
             try:
                 if self._is_ws_open():
                     await self._ws_send_bytes(bytes([0xfb]))
                     self.last_heartbeat = time.time()
-                else:
-                    await self.connect_websocket(aiohttp.ClientSession())
+                # ä¸åœ¨æ­¤å¤„é‡è¿ï¼
             except Exception as e:
-                logger.warning(f"[{self.uid}] ĞÄÌøÒì³£: {e}")
+                logger.warning(f"[{self.uid}] å¿ƒè·³å¼‚å¸¸: {e}")
                 self.connected = False
+                self.websocket = None
             await asyncio.sleep(10)
 
-    async def send_paint_data(self, x, y, r, g, b):
-        if not await self.ensure_connected(aiohttp.ClientSession()):
-            logger.warning(f"[{self.uid}] ÎŞ·¨Á¬½Ó WebSocket£¬Ìø¹ı»æÖÆ ({x},{y})")
+    async def send_paint_data(self, session: aiohttp.ClientSession, x, y, r, g, b):
+        if not await self.ensure_connected(session):
+            logger.warning(f"[{self.uid}] æ— æ³•è¿æ¥ WebSocketï¼Œè·³è¿‡ç»˜åˆ¶ ({x},{y})")
             return False
         if not self.token:
-            logger.warning(f"[{self.uid}] ÎŞÓĞĞ§ Token£¬Ìø¹ı»æÖÆ")
+            logger.warning(f"[{self.uid}] æ— æœ‰æ•ˆ Tokenï¼Œè·³è¿‡ç»˜åˆ¶")
             return False
 
         try:
@@ -191,22 +192,22 @@ class PaintBoardClient:
             packet.extend(struct.pack('<I', self.uid)[:3])
             token_clean = self.token.replace('-', '')
             if len(token_clean) != 32:
-                logger.error(f"[{self.uid}] Token ¸ñÊ½´íÎó")
+                logger.error(f"[{self.uid}] Token æ ¼å¼é”™è¯¯")
                 return False
             token_bytes = bytes.fromhex(token_clean)
             packet.extend(token_bytes)
             packet.extend(struct.pack('<I', random.randint(0, 2**32-1)))
             await self._ws_send_bytes(bytes(packet))
-            logger.debug(f"[{self.uid}] »æÖÆ³É¹¦: ({x},{y}) RGB({r},{g},{b})")
+            logger.debug(f"[{self.uid}] ç»˜åˆ¶æˆåŠŸ: ({x},{y}) RGB({r},{g},{b})")
             return True
         except Exception as e:
-            logger.warning(f"[{self.uid}] »æÖÆÊ§°Ü ({x},{y}): {e}£¬³¢ÊÔË¢ĞÂ Token")
+            logger.warning(f"[{self.uid}] ç»˜åˆ¶å¤±è´¥ ({x},{y}): {e}ï¼Œå°è¯•åˆ·æ–° Token")
             self.token = None
             return False
 
 
 # ---------------------------
-# WorkScheduler£ºÈ«Á¿²îÒìÉ¨Ãè£¨ÎŞÂÛ mode£©
+# WorkSchedulerï¼šå…¨é‡å·®å¼‚æ‰«æï¼ˆæ— è®º modeï¼‰
 # ---------------------------
 class WorkScheduler:
     def __init__(self, image_data, board, offset_x=0, offset_y=0):
@@ -230,7 +231,7 @@ class WorkScheduler:
                     pixels.append((x, y))
         self.work_queue = deque(pixels)
         self.total = len(pixels)
-        logger.info(f"³õÊ¼²îÒìÏñËØÊı: {self.total}")
+        logger.info(f"åˆå§‹å·®å¼‚åƒç´ æ•°: {self.total}")
 
     def get_next_batch(self, batch_size=1):
         batch = []
@@ -244,7 +245,7 @@ class WorkScheduler:
         return batch
 
     def rebuild_from_full_scan(self, board):
-        """È«Á¿ÖØĞÂÉ¨Ãè²îÒì"""
+        """å…¨é‡é‡æ–°æ‰«æå·®å¼‚"""
         old_len = len(self.work_queue)
         self.work_queue.clear()
         for y in range(self.height):
@@ -255,12 +256,12 @@ class WorkScheduler:
                 if not np.array_equal(self.image_data[y, x], board[by, bx]):
                     self.work_queue.append((x, y))
         new_len = len(self.work_queue)
-        logger.info(f"È«Á¿ĞŞ¸´É¨ÃèÍê³É£¬·¢ÏÖ {new_len} ¸ö²îÒìÏñËØ£¨Ô­¶ÓÁĞ: {old_len}£©")
+        logger.info(f"å…¨é‡ä¿®å¤æ‰«æå®Œæˆï¼Œå‘ç° {new_len} ä¸ªå·®å¼‚åƒç´ ï¼ˆåŸé˜Ÿåˆ—: {old_len}ï¼‰")
         self.total = max(self.total, self.done + new_len)
 
 
 # ---------------------------
-# ImagePainter£ºÖ÷»æÖÆÆ÷
+# ImagePainterï¼šä¸»ç»˜åˆ¶å™¨
 # ---------------------------
 class ImagePainter:
     def __init__(self, image_path, offset_x=0, offset_y=0):
@@ -285,7 +286,7 @@ class ImagePainter:
                 board = np.frombuffer(content, dtype=np.uint8).reshape((600, 1000, 3))
                 return board
         except Exception as e:
-            logger.error(f"»ñÈ¡»­°å×´Ì¬Ê§°Ü: {e}")
+            logger.error(f"è·å–ç”»æ¿çŠ¶æ€å¤±è´¥: {e}")
             return None
 
     async def send_task(self, session: aiohttp.ClientSession):
@@ -311,32 +312,34 @@ class ImagePainter:
                 if time.time() - last_log_time > 5:
                     progress = self.scheduler.done / self.scheduler.total if self.scheduler.total else 1
                     active = sum(1 for c in self.clients if c.connected)
+                    # âœ… ä¸¥æ ¼æŒ‰ç…§æŒ‡å®šæ ¼å¼è¾“å‡º
                     logger.info(
-                        f"½ø¶È: {self.scheduler.done}/{self.scheduler.total} ({progress*100:.1f}%) | "
-                        f"´ıĞŞ¸´: {len(self.scheduler.work_queue)} | "
-                        f"»îÔ¾ÕË»§: {active}/{len(self.clients)}"
+                        f"åˆå§‹è¿›åº¦: {self.scheduler.done}/{self.scheduler.total} "
+                        f"({progress*100:.1f}%) - ä¿®å¤ä»»åŠ¡: {len(self.scheduler.work_queue)} "
+                        f"- æ´»åŠ¨è´¦æˆ·: {active}/{len(self.clients)}"
                     )
                     last_log_time = time.time()
                 await asyncio.sleep(0.2)
                 continue
 
-            success = await client.send_paint_data(*batch[0])
+            success = await client.send_paint_data(session, *batch[0])
             self.account_manager.release_account(account['uid'], account['access_key'], client.token)
 
             if time.time() - last_log_time > 5:
                 progress = self.scheduler.done / self.scheduler.total if self.scheduler.total else 1
                 active = sum(1 for c in self.clients if c.connected)
+                # âœ… ä¸¥æ ¼æŒ‰ç…§æŒ‡å®šæ ¼å¼è¾“å‡º
                 logger.info(
-                    f"½ø¶È: {self.scheduler.done}/{self.scheduler.total} ({progress*100:.1f}%) | "
-                    f"´ıĞŞ¸´: {len(self.scheduler.work_queue)} | "
-                    f"»îÔ¾ÕË»§: {active}/{len(self.clients)}"
+                    f"åˆå§‹è¿›åº¦: {self.scheduler.done}/{self.scheduler.total} "
+                    f"({progress*100:.1f}%) - ä¿®å¤ä»»åŠ¡: {len(self.scheduler.work_queue)} "
+                    f"- æ´»åŠ¨è´¦æˆ·: {active}/{len(self.clients)}"
                 )
                 last_log_time = time.time()
 
             await asyncio.sleep(0.05)
 
     async def check_and_repair(self, session: aiohttp.ClientSession):
-        """Ã¿10ÃëÈ«Á¿É¨ÃèÒ»´Î²îÒì"""
+        """æ¯10ç§’å…¨é‡æ‰«æä¸€æ¬¡å·®å¼‚"""
         while self.running:
             if self.scheduler is None:
                 await asyncio.sleep(1)
@@ -349,7 +352,7 @@ class ImagePainter:
                 self.scheduler.rebuild_from_full_scan(board)
                 await asyncio.sleep(10)
             except Exception as e:
-                logger.error(f"È«Á¿ĞŞ¸´É¨ÃèÒì³£: {e}")
+                logger.error(f"å…¨é‡ä¿®å¤æ‰«æå¼‚å¸¸: {e}")
                 await asyncio.sleep(5)
 
     async def run(self):
@@ -359,14 +362,18 @@ class ImagePainter:
         async with aiohttp.ClientSession() as session:
             board = await self.get_board_state(session)
             if board is None:
-                logger.error("ÎŞ·¨»ñÈ¡³õÊ¼»­°å×´Ì¬")
+                logger.error("æ— æ³•è·å–åˆå§‹ç”»æ¿çŠ¶æ€")
                 return False
 
             self.scheduler = WorkScheduler(self.image_data, board, self.offset_x, self.offset_y)
 
             tasks = []
-            for client in self.clients:
-                tasks.append(asyncio.create_task(client.send_heartbeat()))
+
+            # å¯åŠ¨å¿ƒè·³ä»»åŠ¡ï¼ˆå¸¦å»¶è¿Ÿé¿å…è¿æ¥é£æš´ï¼‰
+            for i, client in enumerate(self.clients):
+                await asyncio.sleep(0.2)  # æ¯éš” 0.2 ç§’å¯åŠ¨ä¸€ä¸ªï¼Œé¿å… 429
+                tasks.append(asyncio.create_task(client.send_heartbeat(session)))
+
             tasks.append(asyncio.create_task(self.send_task(session)))
             tasks.append(asyncio.create_task(self.check_and_repair(session)))
 
@@ -383,14 +390,14 @@ class ImagePainter:
 
 def print_banner():
     print("=" * 60)
-    print("                    GenGen Painter (¼«ËÙÈ«Á¿ĞŞ¸´°æ)")
+    print("                    GenGen Painter (æé€Ÿå…¨é‡ä¿®å¤ç‰ˆ)")
     print("=" * 60)
-    print("ÓÅ»¯ÌØĞÔ:")
-    print(f"  ? ÕË»§ÊıÁ¿: {len(USER_CREDENTIALS)} ¸ö")
-    print("  ? Ã¿ÕË»§ÀäÈ´: 30Ãë/µã")
-    print("  ? È«Á¿²îÒìÉ¨Ãè: Ã¿10ÃëÍêÕû±È¶ÔÒ»´Î")
-    print("  ? Token ¸´ÓÃ: ½öÊ§Ğ§Ê±Ë¢ĞÂ")
-    print("  ? ÖĞÎÄÈÕÖ¾: ÊµÊ±½ø¶È + ĞŞ¸´ÏêÇé")
+    print("ä¼˜åŒ–ç‰¹æ€§:")
+    print(f"  â€¢ è´¦æˆ·æ•°é‡: {len(USER_CREDENTIALS)} ä¸ª")
+    print("  â€¢ æ¯è´¦æˆ·å†·å´: 30ç§’/ç‚¹")
+    print("  â€¢ å…¨é‡å·®å¼‚æ‰«æ: æ¯10ç§’å®Œæ•´æ¯”å¯¹ä¸€æ¬¡")
+    print("  â€¢ Token å¤ç”¨: ä»…å¤±æ•ˆæ—¶åˆ·æ–°")
+    print("  â€¢ ä¸­æ–‡æ—¥å¿—: å®æ—¶è¿›åº¦ + ä¿®å¤è¯¦æƒ…")
     print("=" * 60)
 
 
@@ -398,12 +405,12 @@ def get_user_input():
     print_banner()
     image_path = r"c:\Users\admin\Desktop\result.jpeg"
     if not os.path.exists(image_path):
-        print("Ä¬ÈÏÂ·¾¶ÎÄ¼ş²»´æÔÚ£¬ÇëÈ·±£Â·¾¶ÕıÈ·£¡")
+        print("é»˜è®¤è·¯å¾„æ–‡ä»¶ä¸å­˜åœ¨ï¼Œè¯·ç¡®ä¿è·¯å¾„æ­£ç¡®ï¼")
         sys.exit(1)
 
     try:
-        offset_x = int(input("ÇëÊäÈë×óÉÏ½ÇX×ø±êÆ«ÒÆ (Ä¬ÈÏ0): ") or "0")
-        offset_y = int(input("ÇëÊäÈë×óÉÏ½ÇY×ø±êÆ«ÒÆ (Ä¬ÈÏ0): ") or "0")
+        offset_x = int(input("è¯·è¾“å…¥å·¦ä¸Šè§’Xåæ ‡åç§» (é»˜è®¤0): ") or "0")
+        offset_y = int(input("è¯·è¾“å…¥å·¦ä¸Šè§’Yåæ ‡åç§» (é»˜è®¤0): ") or "0")
     except ValueError:
         offset_x, offset_y = 0, 0
 
@@ -413,13 +420,13 @@ def get_user_input():
 async def main():
     image_path, offset_x, offset_y = get_user_input()
     painter = ImagePainter(image_path, offset_x, offset_y)
-    print(f"\n¿ªÊ¼»æÖÆ£¡Ê¹ÓÃ {len(USER_CREDENTIALS)} ¸öÕË»§£¬Ã¿30Ãë/µã")
-    print("³ÌĞòÃ¿10ÃëÈ«Á¿É¨ÃèÒ»´Î²îÒì£¬×Ô¶¯ĞŞ¸´±»¸²¸ÇÏñËØ")
-    print("°´ Ctrl+C Í£Ö¹³ÌĞò\n")
+    print(f"\nå¼€å§‹ç»˜åˆ¶ï¼ä½¿ç”¨ {len(USER_CREDENTIALS)} ä¸ªè´¦æˆ·ï¼Œæ¯30ç§’/ç‚¹")
+    print("ç¨‹åºæ¯10ç§’å…¨é‡æ‰«æä¸€æ¬¡å·®å¼‚ï¼Œè‡ªåŠ¨ä¿®å¤è¢«è¦†ç›–åƒç´ ")
+    print("æŒ‰ Ctrl+C åœæ­¢ç¨‹åº\n")
     try:
         await painter.run()
     except KeyboardInterrupt:
-        print("\n³ÌĞòÒÑÍ£Ö¹")
+        print("\nç¨‹åºå·²åœæ­¢")
 
 
 if __name__ == "__main__":
