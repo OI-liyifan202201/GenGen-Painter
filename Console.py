@@ -13,14 +13,11 @@ import os
 import aiohttp
 
 # ---------------------------
-# 日志配置
+# 日志与配置
 # ---------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------------------
-# 配置
-# ---------------------------
 API_BASE_URL = "https://paintboard.luogu.me"
 WEBSOCKET_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 
@@ -52,11 +49,12 @@ USER_CREDENTIALS = [
     (1035756,"Iyfsiylq")
 ]
 
-MAX_CONCURRENT = 5  # 并发窗口大小
-COOLING_TIME = 30   # 冷却时间（秒）
+MAX_CONCURRENT = 5
+COOLING_TIME = 30
+
 
 # ---------------------------
-# 账号管理器（带 Token 缓存）
+# 账号管理器
 # ---------------------------
 class AccountManager:
     def __init__(self, credentials: List[Tuple[int, str]]):
@@ -91,7 +89,7 @@ class AccountManager:
 
 
 # ---------------------------
-# 绘图客户端（按需连接）
+# 绘图客户端
 # ---------------------------
 class PaintBoardClient:
     def __init__(self, uid: int, access_key: str, account_manager: AccountManager):
@@ -158,15 +156,15 @@ class PaintBoardClient:
 
 
 # ---------------------------
-# 任务调度器（全量差异）
+# 任务调度器（修复进度清零问题）
 # ---------------------------
 class WorkScheduler:
-    def __init__(self, image_data, board, offset_x, offset_y):
+    def __init__(self, image_data: np.ndarray, board: np.ndarray, offset_x: int, offset_y: int):
         self.image_data = image_data
+        self.height, self.width = image_data.shape[:2]
         self.offset_x = offset_x
         self.offset_y = offset_y
-        self.height, self.width = image_data.shape[:2]
-        self.initial_total = 0          # ← 初始差异总数（固定不变）
+        self.initial_total = 0
         self.work_queue = deque()
         self._rebuild(board, first_time=True)
 
@@ -179,24 +177,21 @@ class WorkScheduler:
                     continue
                 if not np.array_equal(self.image_data[y, x], board[by, bx]):
                     new_queue.append((x, y))
-        
         if first_time:
-            self.initial_total = len(new_queue)  # ← 只在第一次设置
-        
+            self.initial_total = len(new_queue)
         self.work_queue = new_queue
-        logger.info(f"✅ 全量检测完成，剩余修复: {len(self.work_queue)} / 初始: {self.initial_total}")
+        remaining = len(new_queue)
+        logger.info(f"✅ 全量检测完成，剩余修复: {remaining} / 初始差异: {self.initial_total}")
 
     def get_next(self) -> Optional[Tuple[int, int, int, int, int]]:
         if not self.work_queue:
             return None
         x, y = self.work_queue.popleft()
         r, g, b = self.image_data[y, x]
-        self.done += 1
         return (x + self.offset_x, y + self.offset_y, int(r), int(g), int(b))
 
     def requeue(self, x_img: int, y_img: int):
         self.work_queue.appendleft((x_img, y_img))
-        self.done = max(0, self.done - 1)
 
 
 # ---------------------------
@@ -273,13 +268,16 @@ class ImagePainter:
 
                     # 打印进度（每5秒）
                     now = time.time()
-                    if now - self._last_log > 2 and self.scheduler:
+                    if now - self._last_log > 5 and self.scheduler:
                         remaining = len(self.scheduler.work_queue)
                         fixed = self.scheduler.initial_total - remaining
                         total = self.scheduler.initial_total or 1
                         pct = (fixed / total) * 100
-
-                        logger.info(f"进度: {fixed}/{total} ({pct:.1f}%) - 修复任务: {remaining} - 活动账户: {active_now}/{len(USER_CREDENTIALS)}")
+                        logger.info(
+                            f"进度: {fixed}/{total} ({pct:.1f}%) "
+                            f"- 修复任务: {remaining} "
+                            f"- 活动账户: {active_now}/{len(USER_CREDENTIALS)}"
+                        )
                         self._last_log = now
 
                 finally:
@@ -291,10 +289,10 @@ class ImagePainter:
             if self.scheduler is None:
                 await asyncio.sleep(2)
                 continue
-            logger.info("开始全量差异检测...")
+            logger.info("🔍 开始全量差异检测...")
             board = await self.get_board(session)
             if board is not None:
-                self.scheduler._rebuild(board)
+                self.scheduler._rebuild(board, first_time=False)
             await asyncio.sleep(10)
 
     async def run(self) -> bool:
@@ -331,10 +329,10 @@ class ImagePainter:
 # ---------------------------
 def print_banner():
     print("=" * 60)
-    print("           GenGen Painter (Python 3.13 · 稳定极速版)")
+    print("           GenGen Painter (Python 3.13 · 进度修复版)")
     print("=" * 60)
     print(f"• 账号数: {len(USER_CREDENTIALS)}")
-    print(f"• 并发数: {MAX_CONCURRENT}")
+    print(f"• 并发: {MAX_CONCURRENT}")
     print("• 模式: 0=扫描线, 1=随机撒点")
     print("=" * 60)
 
@@ -343,7 +341,7 @@ def get_input():
     print_banner()
     path = r"c:\Users\admin\Desktop\result.jpeg"
     if not os.path.exists(path):
-        print("图片不存在，请确认路径！")
+        print("❌ 图片不存在，请确认路径！")
         sys.exit(1)
 
     try:
@@ -351,7 +349,7 @@ def get_input():
         y = int(input("Y偏移 (默认0): ") or "0")
         mode = int(input("模式 (0=扫描线,1=随机,默认0): ") or "0")
         mode = 0 if mode not in (0, 1) else mode
-        print(f"模式: {'扫描线' if mode == 0 else '随机撒点'}")
+        print(f"✅ 模式: {'扫描线' if mode == 0 else '随机撒点'}")
         return path, x, y, mode
     except Exception:
         return path, 0, 0, 0
@@ -363,13 +361,13 @@ def get_input():
 async def main():
     path, x, y, mode = get_input()
     painter = ImagePainter(path, x, y, mode)
-    print("\n开始绘制...")
+    print("\n🚀 开始绘制...")
     print(f"并发: {MAX_CONCURRENT}, 账号: {len(USER_CREDENTIALS)}")
     print("按 Ctrl+C 停止\n")
     try:
         await painter.run()
     except KeyboardInterrupt:
-        print("\n中断退出")
+        print("\n🛑 中断退出")
 
 
 if __name__ == "__main__":
