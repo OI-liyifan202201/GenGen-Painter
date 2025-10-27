@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "https://paintboard.luogu.me"
 
 PROGRESS_PATTERN = re.compile(
-    r".*初始进度:\s*(\d+)/(\d+)\s*\((\d+(?:\.\d+)?)%\)\s*- 修复任务:\s*(\d+)\s*- 活动账户:\s*(\d+)/(\d+)"
+    r".*进度:\s*(\d+)/(\d+)\s*\((\d+(?:\.\d+)?)%\)\s*- 修复任务:\s*(\d+)\s*- 活动账户:\s*(\d+)/(\d+)"
 )
 
 class PaintMode(Enum):
