@@ -373,10 +373,11 @@ async def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         path = sys.argv[1]
-        x = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-        y = int(sys.argv[3]) if len(sys.argv) > 3 else 0
-        mode = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+        x = int(sys.argv[2]) if len(sys.argv) >= 2 else 0
+        y = int(sys.argv[3]) if len(sys.argv) >= 3 else 0
+        mode = int(sys.argv[4]) if len(sys.argv) >= 4 else 0
         mode = 0 if mode not in (0, 1) else mode
+        logger.info(f"模式: {'扫描线' if mode == 0 else '随机撒点'}")
         asyncio.run(ImagePainter(path, x, y, mode).run())
     else:
         asyncio.run(main())
