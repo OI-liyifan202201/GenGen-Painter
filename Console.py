@@ -159,24 +159,31 @@ class PaintBoardClient:
 # 任务调度器（修复进度清零问题）
 # ---------------------------
 class WorkScheduler:
-    def __init__(self, image_data: np.ndarray, board: np.ndarray, offset_x: int, offset_y: int):
+    def __init__(self, image_data: np.ndarray, board: np.ndarray, offset_x: int, offset_y: int, mode: str = "scanline"):
         self.image_data = image_data
         self.height, self.width = image_data.shape[:2]
         self.offset_x = offset_x
         self.offset_y = offset_y
+        self.mode = mode  # "scanline" or "random"
         self.initial_total = 0
         self.work_queue = deque()
         self._rebuild(board, first_time=True)
 
     def _rebuild(self, board: np.ndarray, first_time=False):
-        new_queue = deque()
+        diff_points = []
         for y in range(self.height):
             for x in range(self.width):
                 bx, by = x + self.offset_x, y + self.offset_y
                 if bx >= 1000 or by >= 600:
                     continue
                 if not np.array_equal(self.image_data[y, x], board[by, bx]):
-                    new_queue.append((x, y))
+                    diff_points.append((x, y))
+
+        if self.mode == "random":
+            random.shuffle(diff_points)  # 关键：打乱顺序！
+
+        new_queue = deque(diff_points)
+
         if first_time:
             self.initial_total = len(new_queue)
         self.work_queue = new_queue
@@ -191,7 +198,8 @@ class WorkScheduler:
         return (x + self.offset_x, y + self.offset_y, int(r), int(g), int(b))
 
     def requeue(self, x_img: int, y_img: int):
-        self.work_queue.appendleft((x_img, y_img))
+        # 为了保持随机性，重新放回队尾（或队首，影响不大）
+        self.work_queue.append((x_img, y_img))
 
 
 # ---------------------------
@@ -202,7 +210,7 @@ class ImagePainter:
         self.image_path = image_path
         self.offset_x = offset_x
         self.offset_y = offset_y
-        self.mode = "scanline" if mode == 0 else "random"
+        self.paint_mode = "scanline" if mode == 0 else "random"  # 改名避免混淆
         self.account_manager = AccountManager(USER_CREDENTIALS)
         self.scheduler = None
         self.running = True
@@ -305,7 +313,7 @@ class ImagePainter:
                 logger.error("无法获取初始画板")
                 return False
 
-            self.scheduler = WorkScheduler(self.image_data, board, self.offset_x, self.offset_y)
+            self.scheduler = WorkScheduler(self.image_data, board, self.offset_x, self.offset_y, self.paint_mode)
 
             sem = asyncio.Semaphore(MAX_CONCURRENT)
             tasks = [
